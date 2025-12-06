@@ -3,6 +3,7 @@ package sharded
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"testing"
 
@@ -129,6 +130,10 @@ func TestResume(t *testing.T) {
 		chunk.Write(data[start:end])
 		chunk.Close()
 	}
+	// Save state before interruption (normally done by main goroutine)
+	if err := f1.SaveState(ctx); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
 	// Don't complete - simulate interruption
 
 	// Second write session - should resume
@@ -220,6 +225,10 @@ func TestReset(t *testing.T) {
 	chunk, _ := f1.Next(ctx)
 	chunk.Write(data[:chunkSize])
 	chunk.Close()
+	// Save state (normally done by main goroutine)
+	if err := f1.SaveState(ctx); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
 
 	// Second session with different metadata
 	f2, err := Write(ctx, bucket, "test/reset.bin",
@@ -420,6 +429,169 @@ func TestReadWithVerificationSkipsEmptyChecksums(t *testing.T) {
 	}
 	if !bytes.Equal(result, data) {
 		t.Fatalf("data mismatch")
+	}
+}
+
+func TestCloseSuccessfullyTracksChunk(t *testing.T) {
+	// Test that Close() successfully commits the blob and tracks it in state
+	ctx := context.Background()
+	bucket, err := blob.OpenBucket(ctx, "mem://")
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	defer bucket.Close()
+
+	chunkSize := int64(256)
+	data := make([]byte, chunkSize)
+
+	f, err := Write(ctx, bucket, "test/close-success.bin",
+		WithChunkSize(chunkSize),
+		WithSize(chunkSize),
+		WithStateInterval(1), // Save state after every chunk
+	)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	chunk, err := f.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+
+	// Write full data
+	chunk.Write(data)
+
+	// Close the chunk
+	if err := chunk.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Verify blob exists
+	objectPath := f.partsPrefix + "chunk-000000"
+	exists, err := bucket.Exists(ctx, objectPath)
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if !exists {
+		t.Error("expected blob to exist after successful Close()")
+	}
+
+	// Verify state was updated
+	if f.CompletedCount() != 1 {
+		t.Errorf("expected 1 completed chunk, got %d", f.CompletedCount())
+	}
+}
+
+func TestAbortCleansUpPartialWrite(t *testing.T) {
+	// Abort() should clean up partial data when called BEFORE Close()
+	ctx := context.Background()
+	bucket, err := blob.OpenBucket(ctx, "mem://")
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	defer bucket.Close()
+
+	chunkSize := int64(256)
+	data := make([]byte, chunkSize)
+
+	f, err := Write(ctx, bucket, "test/abort-cleanup.bin",
+		WithChunkSize(chunkSize),
+		WithSize(chunkSize),
+	)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	chunk, err := f.Next(ctx)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+
+	// Write partial data
+	chunk.Write(data[:chunkSize/2])
+
+	// Abort WITHOUT calling Close first
+	chunk.Abort()
+
+	// Blob should NOT exist
+	objectPath := f.partsPrefix + "chunk-000000"
+	exists, err := bucket.Exists(ctx, objectPath)
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+
+	if exists {
+		t.Errorf("blob %s should not exist after Abort()", objectPath)
+	}
+}
+
+func TestChunkWriteSize(t *testing.T) {
+	// Test that chunks are written with the correct size
+	ctx := context.Background()
+	bucket, err := blob.OpenBucket(ctx, "mem://")
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	defer bucket.Close()
+
+	chunkSize := int64(1024)
+	totalSize := int64(3000) // Will create 3 chunks: 1024, 1024, 952
+
+	f, err := Write(ctx, bucket, "test/chunk-sizes.bin",
+		WithChunkSize(chunkSize),
+		WithSize(totalSize),
+		WithStateInterval(1),
+	)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	expectedSizes := []int64{1024, 1024, 952}
+	chunkIndex := 0
+
+	for {
+		chunk, err := f.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+
+		// Verify expected chunk length
+		if chunk.Length() != expectedSizes[chunkIndex] {
+			t.Errorf("chunk %d: expected length %d, got %d", chunkIndex, expectedSizes[chunkIndex], chunk.Length())
+		}
+
+		// Write exact amount expected
+		data := make([]byte, chunk.Length())
+		n, err := chunk.Write(data)
+		if err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		if int64(n) != chunk.Length() {
+			t.Errorf("chunk %d: wrote %d bytes, expected %d", chunkIndex, n, chunk.Length())
+		}
+
+		if err := chunk.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		// Verify blob size in bucket
+		objectPath := f.partsPrefix + "chunk-" + fmt.Sprintf("%06d", chunkIndex)
+		attrs, err := bucket.Attributes(ctx, objectPath)
+		if err != nil {
+			t.Fatalf("Attributes: %v", err)
+		}
+		if attrs.Size != expectedSizes[chunkIndex] {
+			t.Errorf("chunk %d: blob size %d, expected %d", chunkIndex, attrs.Size, expectedSizes[chunkIndex])
+		}
+
+		chunkIndex++
+	}
+
+	if chunkIndex != 3 {
+		t.Errorf("expected 3 chunks, got %d", chunkIndex)
 	}
 }
 

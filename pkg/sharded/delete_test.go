@@ -139,6 +139,10 @@ func TestDeletePartialState(t *testing.T) {
 		chunk.Write(data[start:end])
 		chunk.Close()
 	}
+	// Save state (normally done by main goroutine)
+	if err := f.SaveState(ctx); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
 	// Don't complete - leave in partial state
 
 	// Count objects (should have state file + 2 chunks)

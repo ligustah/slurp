@@ -1,8 +1,6 @@
 package progress
 
 import (
-	"bytes"
-	"strings"
 	"testing"
 	"time"
 )
@@ -14,13 +12,13 @@ func TestFormatBytes(t *testing.T) {
 	}{
 		{0, "0 B"},
 		{100, "100 B"},
-		{1024, "1.00 KB"},
-		{1536, "1.50 KB"},
-		{1024 * 1024, "1.00 MB"},
-		{256 * 1024 * 1024, "256.00 MB"},
-		{1024 * 1024 * 1024, "1.00 GB"},
-		{1024 * 1024 * 1024 * 1024, "1.00 TB"},
-		{2.5 * 1024 * 1024 * 1024 * 1024, "2.50 TB"},
+		{1024, "1.0 KiB"},
+		{1536, "1.5 KiB"},
+		{1024 * 1024, "1.0 MiB"},
+		{256 * 1024 * 1024, "256 MiB"},
+		{1024 * 1024 * 1024, "1.0 GiB"},
+		{1024 * 1024 * 1024 * 1024, "1.0 TiB"},
+		{2.5 * 1024 * 1024 * 1024 * 1024, "2.5 TiB"},
 	}
 
 	for _, tt := range tests {
@@ -38,11 +36,15 @@ func TestParseBytes(t *testing.T) {
 	}{
 		{"100", 100},
 		{"100B", 100},
-		{"1KB", 1024},
-		{"1.5KB", 1536},
-		{"256MB", 256 * 1024 * 1024},
-		{"1GB", 1024 * 1024 * 1024},
-		{"1TB", 1024 * 1024 * 1024 * 1024},
+		{"1KiB", 1024},
+		{"1.5KiB", 1536},
+		{"256MiB", 256 * 1024 * 1024},
+		{"1GiB", 1024 * 1024 * 1024},
+		{"1TiB", 1024 * 1024 * 1024 * 1024},
+		// SI units
+		{"1KB", 1000},
+		{"1MB", 1000 * 1000},
+		{"1GB", 1000 * 1000 * 1000},
 	}
 
 	for _, tt := range tests {
@@ -64,54 +66,11 @@ func TestParseBytesInvalid(t *testing.T) {
 	}
 }
 
-func TestReporterBasic(t *testing.T) {
-	var buf bytes.Buffer
-
-	reporter := NewReporter(Options{
-		TotalSize:      1024 * 1024,
-		TotalChunks:    4,
-		Workers:        2,
-		Output:         &buf,
-		UpdateInterval: 10 * time.Millisecond,
-		SourceURL:      "https://example.com/file.bin",
-		ChunkSize:      256 * 1024,
-	})
-
-	reporter.Start()
-
-	// Simulate chunk progress
-	reporter.ChunkStarted()
-	reporter.ChunkCompleted(256 * 1024)
-
-	reporter.ChunkStarted()
-	reporter.ChunkCompleted(256 * 1024)
-
-	time.Sleep(50 * time.Millisecond) // Let updates run
-
-	reporter.Stop()
-
-	output := buf.String()
-
-	// Verify header was printed
-	if !strings.Contains(output, "https://example.com/file.bin") {
-		t.Error("expected source URL in output")
-	}
-	if !strings.Contains(output, "Chunks: 4") {
-		t.Error("expected total chunks in output")
-	}
-	if !strings.Contains(output, "Workers: 2") {
-		t.Error("expected workers in output")
-	}
-}
-
 func TestReporterChunkTracking(t *testing.T) {
-	var buf bytes.Buffer
-
 	reporter := NewReporter(Options{
 		TotalSize:      1024,
 		TotalChunks:    4,
 		Workers:        2,
-		Output:         &buf,
 		UpdateInterval: 100 * time.Millisecond,
 	})
 
@@ -121,7 +80,8 @@ func TestReporterChunkTracking(t *testing.T) {
 		t.Errorf("expected 1 in-progress, got %d", reporter.inProgress.Load())
 	}
 
-	reporter.ChunkCompleted(256)
+	reporter.BytesWritten(256)
+	reporter.ChunkCompleted()
 	if reporter.inProgress.Load() != 0 {
 		t.Errorf("expected 0 in-progress after complete, got %d", reporter.inProgress.Load())
 	}
@@ -139,20 +99,36 @@ func TestReporterChunkTracking(t *testing.T) {
 	}
 }
 
-func TestFormatDuration(t *testing.T) {
-	tests := []struct {
-		input    time.Duration
-		expected string
-	}{
-		{30 * time.Second, "30s"},
-		{90 * time.Second, "1m 30s"},
-		{3661 * time.Second, "1h 1m 1s"},
-	}
+func TestReporterStartStop(t *testing.T) {
+	reporter := NewReporter(Options{
+		TotalSize:      1024 * 1024,
+		TotalChunks:    4,
+		Workers:        2,
+		UpdateInterval: 10 * time.Millisecond,
+		SourceURL:      "https://example.com/file.bin",
+		ChunkSize:      256 * 1024,
+	})
 
-	for _, tt := range tests {
-		result := formatDuration(tt.input)
-		if result != tt.expected {
-			t.Errorf("formatDuration(%v) = %q, want %q", tt.input, result, tt.expected)
-		}
+	reporter.Start()
+
+	// Simulate chunk progress
+	reporter.ChunkStarted()
+	reporter.BytesWritten(256 * 1024)
+	reporter.ChunkCompleted()
+
+	reporter.ChunkStarted()
+	reporter.BytesWritten(256 * 1024)
+	reporter.ChunkCompleted()
+
+	time.Sleep(50 * time.Millisecond) // Let updates run
+
+	reporter.Stop()
+
+	// Verify state
+	if reporter.completedChunks.Load() != 2 {
+		t.Errorf("expected 2 completed chunks, got %d", reporter.completedChunks.Load())
+	}
+	if reporter.completedBytes.Load() != 512*1024 {
+		t.Errorf("expected 512KB completed, got %d", reporter.completedBytes.Load())
 	}
 }

@@ -36,8 +36,8 @@
 //
 // # Storage Layout
 //
-//	{bucket}/.sharded/{dest-hash}/chunk-0000
-//	{bucket}/.sharded/{dest-hash}/chunk-0001
+//	{bucket}/.sharded/{dest-hash}/chunk-000000
+//	{bucket}/.sharded/{dest-hash}/chunk-000001
 //	{bucket}/.sharded/{dest-hash}/state.json     (during writes)
 //	{bucket}/{dest}.manifest.json                (on completion)
 //
@@ -48,7 +48,7 @@
 //	  "chunk_size": 268435456,
 //	  "parts_prefix": ".sharded/abc123def/",
 //	  "chunks": [
-//	    {"index": 0, "object": "chunk-0000", "size": 268435456, "checksum": "..."},
+//	    {"index": 0, "object": "chunk-000000", "size": 268435456, "checksum": "..."},
 //	    ...
 //	  ],
 //	  "metadata": {"source_url": "...", "source_etag": "..."},

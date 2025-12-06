@@ -42,14 +42,35 @@ type ChunkInfo struct {
 	Checksum string `json:"checksum,omitempty"`
 }
 
+// ChunkStatus represents the state of a chunk during download.
+type ChunkStatus string
+
+const (
+	// ChunkPending means the chunk has not been started yet.
+	ChunkPending ChunkStatus = "pending"
+	// ChunkInProgress means the chunk is currently being downloaded.
+	ChunkInProgress ChunkStatus = "in_progress"
+	// ChunkCompleted means the chunk has been successfully written.
+	ChunkCompleted ChunkStatus = "completed"
+)
+
+// ChunkState tracks the state of a single chunk during download.
+type ChunkState struct {
+	Index    int         `json:"index"`
+	Status   ChunkStatus `json:"status"`
+	Object   string      `json:"object,omitempty"`
+	Size     int64       `json:"size,omitempty"`
+	Checksum string      `json:"checksum,omitempty"`
+}
+
 // state tracks write progress for resume support.
 type state struct {
-	TotalSize       int64             `json:"total_size,omitempty"`
-	ChunkSize       int64             `json:"chunk_size"`
-	PartsPrefix     string            `json:"parts_prefix"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
-	CompletedChunks map[int]ChunkInfo `json:"completed_chunks"`
-	StartedAt       time.Time         `json:"started_at"`
+	TotalSize   int64             `json:"total_size,omitempty"`
+	ChunkSize   int64             `json:"chunk_size"`
+	PartsPrefix string            `json:"parts_prefix"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	Chunks      []ChunkState      `json:"chunks"`
+	StartedAt   time.Time         `json:"started_at"`
 }
 
 // Options configures sharded file operations.
@@ -188,12 +209,12 @@ func (f *File) loadState(ctx context.Context) error {
 		if isNotExist(err) {
 			// No existing state, start fresh
 			f.state = &state{
-				TotalSize:       f.opts.Size,
-				ChunkSize:       f.opts.ChunkSize,
-				PartsPrefix:     f.partsPrefix,
-				Metadata:        f.opts.Metadata,
-				CompletedChunks: make(map[int]ChunkInfo),
-				StartedAt:       time.Now(),
+				TotalSize:   f.opts.Size,
+				ChunkSize:   f.opts.ChunkSize,
+				PartsPrefix: f.partsPrefix,
+				Metadata:    f.opts.Metadata,
+				Chunks:      []ChunkState{},
+				StartedAt:   time.Now(),
 			}
 			return nil
 		}
@@ -207,7 +228,16 @@ func (f *File) loadState(ctx context.Context) error {
 
 	f.state = &s
 	f.partsPrefix = s.PartsPrefix
-	f.completedCount = len(s.CompletedChunks)
+
+	// Count completed chunks and reset in_progress chunks to pending (they were interrupted)
+	for i := range f.state.Chunks {
+		if f.state.Chunks[i].Status == ChunkCompleted {
+			f.completedCount++
+		} else if f.state.Chunks[i].Status == ChunkInProgress {
+			// Interrupted chunk - mark as pending for retry
+			f.state.Chunks[i].Status = ChunkPending
+		}
+	}
 
 	// Recalculate total chunks if we now have size
 	if f.opts.Size > 0 && s.TotalSize == 0 {
@@ -220,13 +250,18 @@ func (f *File) loadState(ctx context.Context) error {
 	return nil
 }
 
-// saveState persists the current state for resume.
-func (f *File) saveState(ctx context.Context) error {
-	statePath := f.partsPrefix + "state.json"
+// SaveState persists the current state for resume.
+// Call this periodically from the main goroutine. Thread-safe.
+// With eventual consistency, it's OK if some updates are lost - the blobs
+// in storage are the source of truth and can be rediscovered on resume.
+func (f *File) SaveState(ctx context.Context) error {
+	f.mu.Lock()
 	data, err := json.MarshalIndent(f.state, "", "  ")
+	f.mu.Unlock()
 	if err != nil {
 		return err
 	}
+	statePath := f.partsPrefix + "state.json"
 	return f.bucket.WriteAll(ctx, statePath, data, nil)
 }
 
@@ -247,10 +282,12 @@ func (f *File) Reset(ctx context.Context) error {
 	defer f.mu.Unlock()
 
 	// Delete all existing chunks
-	for _, chunk := range f.state.CompletedChunks {
-		path := f.partsPrefix + chunk.Object
-		if err := f.bucket.Delete(ctx, path); err != nil && !isNotExist(err) {
-			return fmt.Errorf("delete chunk %s: %w", path, err)
+	for _, chunk := range f.state.Chunks {
+		if chunk.Object != "" {
+			path := f.partsPrefix + chunk.Object
+			if err := f.bucket.Delete(ctx, path); err != nil && !isNotExist(err) {
+				return fmt.Errorf("delete chunk %s: %w", path, err)
+			}
 		}
 	}
 
@@ -262,12 +299,12 @@ func (f *File) Reset(ctx context.Context) error {
 
 	// Reset to fresh state
 	f.state = &state{
-		TotalSize:       f.opts.Size,
-		ChunkSize:       f.opts.ChunkSize,
-		PartsPrefix:     f.partsPrefix,
-		Metadata:        f.opts.Metadata,
-		CompletedChunks: make(map[int]ChunkInfo),
-		StartedAt:       time.Now(),
+		TotalSize:   f.opts.Size,
+		ChunkSize:   f.opts.ChunkSize,
+		PartsPrefix: f.partsPrefix,
+		Metadata:    f.opts.Metadata,
+		Chunks:      []ChunkState{},
+		StartedAt:   time.Now(),
 	}
 	f.currentIndex = 0
 	f.completedCount = 0
@@ -309,13 +346,41 @@ func (f *File) Next(ctx context.Context) (*Chunk, error) {
 		computeChecksum: f.opts.ComputeChecksum,
 	}
 
-	// Check if this chunk was already written
-	if info, ok := f.state.CompletedChunks[idx]; ok {
-		chunk.info = &info
-		return chunk, ErrChunkFilled
+	// Look up chunk state
+	chunkState := f.findChunk(idx)
+	if chunkState != nil {
+		if chunkState.Status == ChunkCompleted {
+			// Already completed - return info for verification if needed
+			chunk.info = &ChunkInfo{
+				Index:    chunkState.Index,
+				Object:   chunkState.Object,
+				Size:     chunkState.Size,
+				Checksum: chunkState.Checksum,
+			}
+			return chunk, ErrChunkFilled
+		}
+		// Pending chunk (from interrupted run) - mark as in_progress
+		chunkState.Status = ChunkInProgress
+	} else {
+		// New chunk - add to state as in_progress
+		f.state.Chunks = append(f.state.Chunks, ChunkState{
+			Index:  idx,
+			Status: ChunkInProgress,
+		})
 	}
 
 	return chunk, nil
+}
+
+// findChunk returns the chunk state for the given index, or nil if not found.
+// Must be called with f.mu held.
+func (f *File) findChunk(idx int) *ChunkState {
+	for i := range f.state.Chunks {
+		if f.state.Chunks[i].Index == idx {
+			return &f.state.Chunks[i]
+		}
+	}
+	return nil
 }
 
 // Complete finalizes the sharded file, writing the manifest and cleaning up state.
@@ -328,7 +393,7 @@ func (f *File) Complete(ctx context.Context) error {
 	}
 	f.closed = true
 
-	// Build manifest
+	// Build manifest from completed chunks
 	manifest := Manifest{
 		TotalSize:   f.state.TotalSize,
 		ChunkSize:   f.state.ChunkSize,
@@ -337,10 +402,17 @@ func (f *File) Complete(ctx context.Context) error {
 		CompletedAt: time.Now(),
 	}
 
-	// Sort chunks by index
-	manifest.Chunks = make([]ChunkInfo, len(f.state.CompletedChunks))
-	for _, info := range f.state.CompletedChunks {
-		manifest.Chunks[info.Index] = info
+	// Build sorted chunks slice - only include completed chunks
+	manifest.Chunks = make([]ChunkInfo, f.completedCount)
+	for _, cs := range f.state.Chunks {
+		if cs.Status == ChunkCompleted {
+			manifest.Chunks[cs.Index] = ChunkInfo{
+				Index:    cs.Index,
+				Object:   cs.Object,
+				Size:     cs.Size,
+				Checksum: cs.Checksum,
+			}
+		}
 	}
 
 	// Calculate total size if not set
@@ -392,11 +464,12 @@ type Chunk struct {
 	computeChecksum bool
 	info            *ChunkInfo // Set if chunk was already filled
 
-	mu     sync.Mutex
-	writer *blob.Writer
-	hash   *sha256Writer
-	size   int64
-	closed bool
+	mu           sync.Mutex
+	writer       *blob.Writer
+	writerCancel context.CancelFunc // Cancel to abort the write
+	hash         *sha256Writer
+	size         int64
+	closed       bool
 }
 
 // Index returns the chunk index (0, 1, 2, ...).
@@ -425,12 +498,15 @@ func (c *Chunk) Write(p []byte) (n int, err error) {
 
 	// Lazy initialization
 	if c.writer == nil {
-		ctx := context.Background()
-		objectName := fmt.Sprintf("chunk-%04d", c.index)
+		ctx, cancel := context.WithCancel(context.Background())
+		c.writerCancel = cancel
+
+		objectName := fmt.Sprintf("chunk-%06d", c.index)
 		path := c.file.partsPrefix + objectName
 
 		w, err := c.file.bucket.NewWriter(ctx, path, nil)
 		if err != nil {
+			cancel()
 			return 0, fmt.Errorf("create chunk writer: %w", err)
 		}
 		c.writer = w
@@ -452,7 +528,47 @@ func (c *Chunk) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// Close closes the chunk, persisting it to storage and updating state.
+// Abort cancels the chunk write and cleans up any partial data from storage.
+// Use this when a chunk download fails or is cancelled.
+// Marks the chunk as pending so it can be retried.
+// Safe to call multiple times or after Close.
+func (c *Chunk) Abort() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return
+	}
+	c.closed = true
+
+	if c.writer != nil {
+		// Cancel the context first to abort the upload
+		if c.writerCancel != nil {
+			c.writerCancel()
+		}
+		// Must still close writer to release resources
+		c.writer.Close()
+
+		// Delete any partial data that was uploaded before cancellation.
+		// GCS resumable uploads may have committed partial buffers.
+		ctx := context.Background()
+		objectName := fmt.Sprintf("chunk-%06d", c.index)
+		path := c.file.partsPrefix + objectName
+		c.file.bucket.Delete(ctx, path) // Best effort, ignore errors
+	}
+
+	// Mark chunk as pending so it can be retried
+	c.file.mu.Lock()
+	chunkState := c.file.findChunk(c.index)
+	if chunkState != nil {
+		chunkState.Status = ChunkPending
+	}
+	c.file.mu.Unlock()
+}
+
+// Close closes the chunk, persisting it to storage and updating in-memory state.
+// Does NOT persist state to storage - call File.SaveState() periodically from
+// the main goroutine for eventual consistency.
 func (c *Chunk) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -467,39 +583,33 @@ func (c *Chunk) Close() error {
 		return nil
 	}
 
-	// If writer was never created (no writes), create empty chunk
+	// If writer was never created (no writes), nothing to do
 	if c.writer == nil {
 		return nil
 	}
 
+	// Close the writer - this commits the blob to storage
 	if err := c.writer.Close(); err != nil {
 		return fmt.Errorf("close chunk writer: %w", err)
 	}
 
-	// Update state
-	objectName := fmt.Sprintf("chunk-%04d", c.index)
-	info := ChunkInfo{
-		Index:  c.index,
-		Object: objectName,
-		Size:   c.size,
-	}
+	// Update in-memory state - mark chunk as completed
+	objectName := fmt.Sprintf("chunk-%06d", c.index)
+	checksum := ""
 	if c.hash != nil {
-		info.Checksum = c.hash.Sum()
+		checksum = c.hash.Sum()
 	}
 
 	c.file.mu.Lock()
-	c.file.state.CompletedChunks[c.index] = info
-	c.file.completedCount++
-	shouldSave := c.file.completedCount%c.file.opts.StateInterval == 0
-	c.file.mu.Unlock()
-
-	// Persist state periodically
-	if shouldSave {
-		ctx := context.Background()
-		if err := c.file.saveState(ctx); err != nil {
-			return fmt.Errorf("save state: %w", err)
-		}
+	chunkState := c.file.findChunk(c.index)
+	if chunkState != nil {
+		chunkState.Status = ChunkCompleted
+		chunkState.Object = objectName
+		chunkState.Size = c.size
+		chunkState.Checksum = checksum
 	}
+	c.file.completedCount++
+	c.file.mu.Unlock()
 
 	return nil
 }

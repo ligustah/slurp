@@ -105,8 +105,7 @@ Options:`)
 			TotalSize:      info.Size,
 			TotalChunks:    totalChunks,
 			Workers:        *workers,
-			Output:         os.Stdout,
-			UpdateInterval: 500 * time.Millisecond,
+			UpdateInterval: 5 * time.Second,
 			SourceURL:      *url,
 			ChunkSize:      chunkBytes,
 		})

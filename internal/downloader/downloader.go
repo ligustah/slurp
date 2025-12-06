@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
+	"time"
 
 	"gocloud.dev/blob"
 
@@ -42,6 +44,11 @@ type Options struct {
 	// NoChecksum disables SHA256 checksum computation during writes.
 	// This improves write performance when relying on object store integrity.
 	NoChecksum bool
+
+	// StateSaveInterval is how often to persist download state for resume.
+	// Set to 0 to disable periodic saves (state still saved on completion).
+	// Default: 1 minute.
+	StateSaveInterval time.Duration
 }
 
 // FailedChunk records information about a chunk that failed to download.
@@ -107,6 +114,9 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	if opts.MaxConsecutiveFailures <= 0 {
 		opts.MaxConsecutiveFailures = 10
 	}
+	if opts.StateSaveInterval == 0 {
+		opts.StateSaveInterval = 1 * time.Minute
+	}
 	if opts.HTTPOptions.MaxIdleConnsPerHost == 0 {
 		opts.HTTPOptions = slurphttp.DefaultOptions()
 	}
@@ -169,6 +179,34 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	cbCtx, cbCancel := context.WithCancel(ctx)
 	defer cbCancel()
 
+	// Start background state saver goroutine
+	stateSaverDone := make(chan struct{})
+	go func() {
+		defer close(stateSaverDone)
+		ticker := time.NewTicker(opts.StateSaveInterval)
+		defer ticker.Stop()
+
+		lastSaved := 0
+		for {
+			select {
+			case <-ticker.C:
+				current := f.CompletedCount()
+				if current > lastSaved {
+					if err := f.SaveState(ctx); err == nil {
+						lastSaved = current
+					}
+					// Ignore errors - eventual consistency
+				}
+			case <-cbCtx.Done():
+				// Final save before exit
+				if err := f.SaveState(ctx); err != nil {
+					slog.Warn("failed to save final state", "error", err)
+				}
+				return
+			}
+		}
+	}()
+
 	// Create worker pool
 	type chunkJob struct {
 		chunk *sharded.Chunk
@@ -187,6 +225,7 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 
 				cbMu.Lock()
 				if err != nil {
+					slog.Warn("chunk failed", "chunk", job.chunk.Index(), "error", err)
 					consecutiveFailures++
 					failedChunks = append(failedChunks, FailedChunk{
 						Index: job.chunk.Index(),
@@ -211,6 +250,7 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	}
 
 	// Feed jobs to workers
+	var jobFeederErr error
 	go func() {
 		defer close(jobs)
 		for {
@@ -222,6 +262,11 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 				continue // Skip already-completed chunks
 			}
 			if err != nil {
+				// Context cancellation is expected during shutdown
+				if cbCtx.Err() == nil {
+					jobFeederErr = err
+					slog.Error("job feeder error", "error", err)
+				}
 				return
 			}
 
@@ -235,6 +280,10 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 
 	// Wait for completion
 	wg.Wait()
+
+	// Signal state saver to do final save and exit
+	cbCancel()
+	<-stateSaverDone
 
 	// Check circuit breaker
 	cbMu.Lock()
@@ -253,6 +302,11 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 		return ctx.Err()
 	}
 
+	// Check job feeder error
+	if jobFeederErr != nil {
+		return fmt.Errorf("job feeder: %w", jobFeederErr)
+	}
+
 	// Complete the sharded file
 	if err := f.Complete(ctx); err != nil {
 		return fmt.Errorf("complete sharded file: %w", err)
@@ -261,42 +315,129 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	return nil
 }
 
-// downloadChunk downloads a single chunk.
+// downloadChunk downloads a single chunk with resume support.
+// If the connection drops mid-download, it will retry from where it left off.
 func downloadChunk(ctx context.Context, client *slurphttp.Client, url string, chunk *sharded.Chunk, reporter *progress.Reporter) error {
 	if reporter != nil {
 		reporter.ChunkStarted()
 	}
 
-	startByte := chunk.Offset()
-	endByte := startByte + chunk.Length() - 1
+	// Ensure chunk is closed/aborted on any exit path
+	var success bool
+	defer func() {
+		if !success {
+			chunk.Abort() // Clean up writer without updating state
+		}
+	}()
 
-	resp, err := client.GetRange(ctx, url, startByte, endByte)
-	if err != nil {
+	chunkStart := chunk.Offset()
+	chunkEnd := chunkStart + chunk.Length() - 1
+	expectedSize := chunk.Length()
+
+	downloadStart := time.Now()
+	slog.Info("chunk download started", "chunk", chunk.Index(), "offset", chunkStart, "size", expectedSize)
+
+	var totalWritten int64
+
+	// Download with resume support - retry from where we left off on clean disconnects.
+	// We only retry if the server closes cleanly without error; errors (like timeouts) fail immediately.
+	const maxRetries = 10 // Safety limit for retries within a chunk
+	retries := 0
+
+	for totalWritten < expectedSize {
+		currentStart := chunkStart + totalWritten
+		resp, err := client.GetRange(ctx, url, currentStart, chunkEnd)
+		if err != nil {
+			if reporter != nil {
+				reporter.ChunkFailed()
+			}
+			return fmt.Errorf("download chunk %d (offset %d): %w", chunk.Index(), totalWritten, err)
+		}
+
+		// Verify Content-Length matches what we expect
+		expectedRemaining := expectedSize - totalWritten
+		if resp.ContentLength > 0 && resp.ContentLength != expectedRemaining {
+			resp.Body.Close()
+			if reporter != nil {
+				reporter.ChunkFailed()
+			}
+			return fmt.Errorf("chunk %d: server returned Content-Length %d, expected %d",
+				chunk.Index(), resp.ContentLength, expectedRemaining)
+		}
+
+		// Wrap chunk in progress writer for real-time byte tracking
+		var dst io.Writer = chunk
+		if reporter != nil {
+			dst = &progressWriter{w: chunk, reporter: reporter}
+		}
+
+		n, err := io.Copy(dst, resp.Body)
+		resp.Body.Close()
+
+		totalWritten += n
+
+		if err != nil {
+			// Any error during copy (timeout, network error, etc) should fail immediately
+			// We don't retry on errors - only on clean disconnects (EOF with partial data)
+			if reporter != nil {
+				reporter.ChunkFailed()
+			}
+			return fmt.Errorf("write chunk %d: %w", chunk.Index(), err)
+		}
+
+		// If we didn't get all the data but no error, the server closed the connection cleanly
+		if totalWritten < expectedSize {
+			retries++
+			if retries >= maxRetries {
+				if reporter != nil {
+					reporter.ChunkFailed()
+				}
+				return fmt.Errorf("chunk %d: too many retries (%d), only received %d of %d bytes",
+					chunk.Index(), retries, totalWritten, expectedSize)
+			}
+			// Continue to retry from new offset
+			continue
+		}
+	}
+
+	// Verify we received all expected data
+	if totalWritten != expectedSize {
 		if reporter != nil {
 			reporter.ChunkFailed()
 		}
-		return fmt.Errorf("download chunk %d: %w", chunk.Index(), err)
-	}
-	defer resp.Body.Close()
-
-	n, err := io.Copy(chunk, resp.Body)
-	if err != nil {
-		if reporter != nil {
-			reporter.ChunkFailed()
-		}
-		return fmt.Errorf("write chunk %d: %w", chunk.Index(), err)
+		return fmt.Errorf("chunk %d: received %d bytes, expected %d", chunk.Index(), totalWritten, expectedSize)
 	}
 
+	slog.Info("chunk download complete", "chunk", chunk.Index(), "size", totalWritten, "download_time", time.Since(downloadStart))
+
+	// Close the chunk - this triggers the GCS upload
+	closeStart := time.Now()
 	if err := chunk.Close(); err != nil {
 		if reporter != nil {
 			reporter.ChunkFailed()
 		}
 		return fmt.Errorf("close chunk %d: %w", chunk.Index(), err)
 	}
+	slog.Info("chunk uploaded", "chunk", chunk.Index(), "size", totalWritten, "upload_time", time.Since(closeStart))
 
+	success = true // Mark success so defer doesn't abort
 	if reporter != nil {
-		reporter.ChunkCompleted(n)
+		reporter.ChunkCompleted()
 	}
 
 	return nil
+}
+
+// progressWriter wraps a writer and reports bytes written to a progress reporter.
+type progressWriter struct {
+	w        io.Writer
+	reporter *progress.Reporter
+}
+
+func (pw *progressWriter) Write(p []byte) (n int, err error) {
+	n, err = pw.w.Write(p)
+	if n > 0 && pw.reporter != nil {
+		pw.reporter.BytesWritten(int64(n))
+	}
+	return n, err
 }

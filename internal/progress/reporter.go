@@ -2,11 +2,12 @@ package progress
 
 import (
 	"fmt"
-	"io"
-	"os"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/dustin/go-humanize"
 )
 
 // Options configures the progress reporter.
@@ -20,12 +21,8 @@ type Options struct {
 	// Workers is the number of parallel workers.
 	Workers int
 
-	// Output is where to write progress output.
-	// Default: os.Stdout
-	Output io.Writer
-
-	// UpdateInterval is how often to update the progress display.
-	// Default: 500ms
+	// UpdateInterval is how often to log progress.
+	// Default: 5s
 	UpdateInterval time.Duration
 
 	// SourceURL is the URL being downloaded (for display).
@@ -35,33 +32,33 @@ type Options struct {
 	ChunkSize int64
 }
 
-// Reporter outputs human-readable progress information.
+// Reporter outputs progress information via slog.
 type Reporter struct {
 	opts Options
 
-	mu              sync.Mutex
 	completedBytes  atomic.Int64
 	completedChunks atomic.Int32
 	inProgress      atomic.Int32
 	startTime       time.Time
-	lastUpdate      time.Time
 	lastBytes       int64
-	stopCh          chan struct{}
-	stopped         bool
+	lastUpdate      time.Time
+
+	mu      sync.Mutex
+	stopCh  chan struct{}
+	doneCh  chan struct{}
+	stopped bool
 }
 
 // NewReporter creates a new progress reporter.
 func NewReporter(opts Options) *Reporter {
-	if opts.Output == nil {
-		opts.Output = os.Stdout
-	}
 	if opts.UpdateInterval == 0 {
-		opts.UpdateInterval = 500 * time.Millisecond
+		opts.UpdateInterval = 5 * time.Second
 	}
 
 	return &Reporter{
 		opts:   opts,
 		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
 	}
 }
 
@@ -70,19 +67,18 @@ func (r *Reporter) Start() {
 	r.startTime = time.Now()
 	r.lastUpdate = r.startTime
 
-	// Print header
-	fmt.Fprintf(r.opts.Output, "[slurp] Downloading: %s\n", r.opts.SourceURL)
-	fmt.Fprintf(r.opts.Output, "[slurp] Total size: %s | Chunks: %d x %s | Workers: %d\n",
-		formatBytes(r.opts.TotalSize),
-		r.opts.TotalChunks,
-		formatBytes(r.opts.ChunkSize),
-		r.opts.Workers,
+	slog.Info("starting download",
+		"url", r.opts.SourceURL,
+		"size", humanize.IBytes(uint64(r.opts.TotalSize)),
+		"chunks", r.opts.TotalChunks,
+		"chunk_size", humanize.IBytes(uint64(r.opts.ChunkSize)),
+		"workers", r.opts.Workers,
 	)
 
 	go r.updateLoop()
 }
 
-// Stop stops the progress reporter.
+// Stop stops the progress reporter and waits for final output.
 func (r *Reporter) Stop() {
 	r.mu.Lock()
 	if r.stopped {
@@ -93,6 +89,7 @@ func (r *Reporter) Stop() {
 	r.mu.Unlock()
 
 	close(r.stopCh)
+	<-r.doneCh
 }
 
 // ChunkStarted marks a chunk as in progress.
@@ -101,8 +98,8 @@ func (r *Reporter) ChunkStarted() {
 }
 
 // ChunkCompleted marks a chunk as completed.
-func (r *Reporter) ChunkCompleted(size int64) {
-	r.completedBytes.Add(size)
+// Note: bytes should already have been reported via BytesWritten during streaming.
+func (r *Reporter) ChunkCompleted() {
 	r.completedChunks.Add(1)
 	r.inProgress.Add(-1)
 }
@@ -112,24 +109,31 @@ func (r *Reporter) ChunkFailed() {
 	r.inProgress.Add(-1)
 }
 
-// updateLoop periodically updates the progress display.
+// BytesWritten adds to the running byte count for in-progress tracking.
+// Call this as data streams in, before ChunkCompleted.
+func (r *Reporter) BytesWritten(n int64) {
+	r.completedBytes.Add(n)
+}
+
+// updateLoop periodically logs progress.
 func (r *Reporter) updateLoop() {
+	defer close(r.doneCh)
 	ticker := time.NewTicker(r.opts.UpdateInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-r.stopCh:
-			r.printFinalStatus()
+			r.logFinalStatus()
 			return
 		case <-ticker.C:
-			r.printProgress()
+			r.logProgress()
 		}
 	}
 }
 
-// printProgress outputs the current progress.
-func (r *Reporter) printProgress() {
+// logProgress outputs the current progress.
+func (r *Reporter) logProgress() {
 	now := time.Now()
 	completed := r.completedBytes.Load()
 	completedChunks := int(r.completedChunks.Load())
@@ -154,9 +158,9 @@ func (r *Reporter) printProgress() {
 		if speed > 0 {
 			remaining := float64(r.opts.TotalSize - completed)
 			etaSeconds := remaining / speed
-			eta = formatDuration(time.Duration(etaSeconds * float64(time.Second)))
+			eta = humanize.RelTime(time.Now(), time.Now().Add(time.Duration(etaSeconds)*time.Second), "", "")
 		} else {
-			eta = "calculating..."
+			eta = "calculating"
 		}
 	}
 
@@ -165,123 +169,47 @@ func (r *Reporter) printProgress() {
 		pending = 0
 	}
 
-	fmt.Fprintf(r.opts.Output, "\r[slurp] Progress: %.1f%% | %s / %s | Speed: %s/s | ETA: %s    ",
-		percent,
-		formatBytes(completed),
-		formatBytes(r.opts.TotalSize),
-		formatBytes(int64(speed)),
-		eta,
-	)
-	fmt.Fprintf(r.opts.Output, "\n[slurp] Chunks: %d completed | %d in-progress | %d pending    \033[A",
-		completedChunks,
-		inProgress,
-		pending,
+	slog.Info("progress",
+		"percent", fmt.Sprintf("%.1f%%", percent),
+		"completed", humanize.IBytes(uint64(completed)),
+		"total", humanize.IBytes(uint64(r.opts.TotalSize)),
+		"speed", humanize.IBytes(uint64(speed))+"/s",
+		"eta", eta,
+		"chunks_done", completedChunks,
+		"chunks_active", inProgress,
+		"chunks_pending", pending,
 	)
 }
 
-// printFinalStatus outputs the final status.
-func (r *Reporter) printFinalStatus() {
+// logFinalStatus outputs the final status.
+func (r *Reporter) logFinalStatus() {
 	completed := r.completedBytes.Load()
 	completedChunks := int(r.completedChunks.Load())
 	duration := time.Since(r.startTime)
-	avgSpeed := float64(completed) / duration.Seconds()
+	var avgSpeed float64
+	if duration.Seconds() > 0 {
+		avgSpeed = float64(completed) / duration.Seconds()
+	}
 
-	fmt.Fprintf(r.opts.Output, "\r[slurp] Progress: 100.0%% | %s / %s | Speed: %s/s | Complete!    \n",
-		formatBytes(completed),
-		formatBytes(r.opts.TotalSize),
-		formatBytes(int64(avgSpeed)),
-	)
-	fmt.Fprintf(r.opts.Output, "[slurp] Chunks: %d completed | 0 in-progress | 0 pending    \n",
-		completedChunks,
-	)
-	fmt.Fprintf(r.opts.Output, "[slurp] Total time: %s | Average speed: %s/s\n",
-		formatDuration(duration),
-		formatBytes(int64(avgSpeed)),
+	slog.Info("download complete",
+		"completed", humanize.IBytes(uint64(completed)),
+		"total", humanize.IBytes(uint64(r.opts.TotalSize)),
+		"chunks", completedChunks,
+		"duration", duration.Round(time.Second).String(),
+		"avg_speed", humanize.IBytes(uint64(avgSpeed))+"/s",
 	)
 }
 
-// formatBytes formats bytes as a human-readable string.
-func formatBytes(b int64) string {
-	const (
-		KB = 1024
-		MB = KB * 1024
-		GB = MB * 1024
-		TB = GB * 1024
-	)
-
-	switch {
-	case b >= TB:
-		return fmt.Sprintf("%.2f TB", float64(b)/float64(TB))
-	case b >= GB:
-		return fmt.Sprintf("%.2f GB", float64(b)/float64(GB))
-	case b >= MB:
-		return fmt.Sprintf("%.2f MB", float64(b)/float64(MB))
-	case b >= KB:
-		return fmt.Sprintf("%.2f KB", float64(b)/float64(KB))
-	default:
-		return fmt.Sprintf("%d B", b)
-	}
-}
-
-// formatDuration formats a duration as a human-readable string.
-func formatDuration(d time.Duration) string {
-	if d < time.Minute {
-		return fmt.Sprintf("%.0fs", d.Seconds())
-	}
-	if d < time.Hour {
-		m := int(d.Minutes())
-		s := int(d.Seconds()) % 60
-		return fmt.Sprintf("%dm %ds", m, s)
-	}
-	h := int(d.Hours())
-	m := int(d.Minutes()) % 60
-	s := int(d.Seconds()) % 60
-	return fmt.Sprintf("%dh %dm %ds", h, m, s)
-}
-
-// FormatBytes is exported for use by other packages.
+// FormatBytes formats bytes as a human-readable string.
 func FormatBytes(b int64) string {
-	return formatBytes(b)
+	return humanize.IBytes(uint64(b))
 }
 
 // ParseBytes parses a human-readable byte string (e.g., "256MB").
 func ParseBytes(s string) (int64, error) {
-	var multiplier int64 = 1
-	s = trimSuffix(s, " ")
-
-	switch {
-	case hasSuffix(s, "TB"):
-		multiplier = 1024 * 1024 * 1024 * 1024
-		s = s[:len(s)-2]
-	case hasSuffix(s, "GB"):
-		multiplier = 1024 * 1024 * 1024
-		s = s[:len(s)-2]
-	case hasSuffix(s, "MB"):
-		multiplier = 1024 * 1024
-		s = s[:len(s)-2]
-	case hasSuffix(s, "KB"):
-		multiplier = 1024
-		s = s[:len(s)-2]
-	case hasSuffix(s, "B"):
-		s = s[:len(s)-1]
-	}
-
-	var value float64
-	_, err := fmt.Sscanf(s, "%f", &value)
+	b, err := humanize.ParseBytes(s)
 	if err != nil {
 		return 0, fmt.Errorf("invalid byte string: %s", s)
 	}
-
-	return int64(value * float64(multiplier)), nil
-}
-
-func hasSuffix(s, suffix string) bool {
-	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
-}
-
-func trimSuffix(s, suffix string) string {
-	for hasSuffix(s, suffix) {
-		s = s[:len(s)-len(suffix)]
-	}
-	return s
+	return int64(b), nil
 }

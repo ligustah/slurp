@@ -33,7 +33,7 @@ func TestDefaultConfig(t *testing.T) {
 func TestLoadFromYAML(t *testing.T) {
 	yamlContent := `
 workers: 32
-chunk_size: 512MB
+chunk_size: 512MiB
 progress: true
 state_interval: 5
 retry:
@@ -79,7 +79,7 @@ retry:
 func TestLoadFromEnv(t *testing.T) {
 	// Set env vars
 	t.Setenv("SLURP_WORKERS", "64")
-	t.Setenv("SLURP_CHUNK_SIZE", "1GB")
+	t.Setenv("SLURP_CHUNK_SIZE", "1GiB")
 	t.Setenv("SLURP_PROGRESS", "true")
 	t.Setenv("SLURP_RETRY_ATTEMPTS", "3")
 	t.Setenv("SLURP_RETRY_BACKOFF", "500ms")

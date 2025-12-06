@@ -429,3 +429,182 @@ func TestCircuitBreakerResetsOnSuccess(t *testing.T) {
 		t.Errorf("expected %d bytes, got %d", len(data), len(result))
 	}
 }
+
+func TestTimeoutMidDownload(t *testing.T) {
+	// Simulate a slow server that causes timeout mid-download
+	chunkSize := int64(256 * 1024) // 256KB
+	totalSize := chunkSize * 2     // 2 chunks
+
+	data := make([]byte, totalSize)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("ETag", `"test"`)
+			return
+		}
+
+		rangeHeader := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
+		parts := strings.Split(rangeHeader, "-")
+		start, _ := strconv.ParseInt(parts[0], 10, 64)
+		end, _ := strconv.ParseInt(parts[1], 10, 64)
+
+		w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10)+"/"+strconv.FormatInt(totalSize, 10))
+		w.Header().Set("Content-Length", strconv.Itoa(int(end-start+1)))
+		w.WriteHeader(http.StatusPartialContent)
+
+		// Send first portion of data immediately, then hang
+		// This ensures data is written to the chunk before timeout
+		partialSize := (end - start + 1) / 4 // Send 25% of the data
+		w.Write(data[start : start+partialSize])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Sleep longer than the client timeout to trigger timeout mid-stream
+		time.Sleep(500 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	bucket, err := blob.OpenBucket(ctx, "mem://")
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	defer bucket.Close()
+
+	err = Download(ctx, server.URL, bucket, "test/timeout.bin", Options{
+		Workers:                1,
+		ChunkSize:              chunkSize,
+		MaxConsecutiveFailures: 2,
+		StateInterval:          1,
+		HTTPOptions: slurphttp.Options{
+			RetryAttempts: 0,                      // No retries
+			Timeout:       300 * time.Millisecond, // Very short timeout
+		},
+	})
+
+	// Should fail due to timeout
+	if err == nil {
+		t.Fatal("expected error for timeout, got success")
+	}
+	t.Logf("Got expected error: %v", err)
+
+	// Check what's in the bucket - there should be NO partial chunk blobs
+	// (state.json is OK - it's for resume)
+	iter := bucket.List(&blob.ListOptions{Prefix: ".sharded/"})
+	var partialChunks []string
+	for {
+		obj, err := iter.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		// state.json is expected - it's for resume
+		if strings.HasSuffix(obj.Key, "state.json") {
+			continue
+		}
+		partialChunks = append(partialChunks, obj.Key)
+	}
+
+	if len(partialChunks) > 0 {
+		t.Errorf("expected no partial chunks in bucket after timeout, found: %v", partialChunks)
+		for _, key := range partialChunks {
+			data, _ := bucket.ReadAll(ctx, key)
+			t.Logf("  %s: %d bytes (expected 0 or %d)", key, len(data), chunkSize)
+		}
+	}
+}
+
+func TestPartialHTTPResponse(t *testing.T) {
+	// Test what happens when HTTP server returns less data than Content-Length claims
+	// This simulates a connection being cut mid-transfer
+	chunkSize := int64(256 * 1024) // 256KB
+	totalSize := chunkSize * 4     // 1MB total, 4 chunks
+
+	data := make([]byte, totalSize)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("ETag", `"test"`)
+			return
+		}
+
+		rangeHeader := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
+		parts := strings.Split(rangeHeader, "-")
+		start, _ := strconv.ParseInt(parts[0], 10, 64)
+		end, _ := strconv.ParseInt(parts[1], 10, 64)
+
+		// Claim we're sending full range, but only send partial data
+		w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10)+"/"+strconv.FormatInt(totalSize, 10))
+		w.Header().Set("Content-Length", strconv.Itoa(int(end-start+1)))
+		w.WriteHeader(http.StatusPartialContent)
+
+		// Only send 1/4 of the requested data!
+		partialEnd := start + (end-start+1)/4
+		w.Write(data[start:partialEnd])
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	bucket, err := blob.OpenBucket(ctx, "mem://")
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	defer bucket.Close()
+
+	err = Download(ctx, server.URL, bucket, "test/partial.bin", Options{
+		Workers:                1, // Single worker for predictable behavior
+		ChunkSize:              chunkSize,
+		MaxConsecutiveFailures: 2, // Trip quickly
+		StateInterval:          1,
+		HTTPOptions: slurphttp.Options{
+			RetryAttempts: 0, // No retries - fail immediately
+			Timeout:       5 * time.Second,
+		},
+	})
+
+	// Should fail due to partial data
+	if err == nil {
+		t.Fatal("expected error for partial HTTP response, got success")
+	}
+	t.Logf("Got expected error: %v", err)
+
+	// Check what's in the bucket - there should be NO partial chunk blobs
+	// (state.json is OK - it's for resume)
+	iter := bucket.List(&blob.ListOptions{Prefix: ".sharded/"})
+	var partialChunks []string
+	for {
+		obj, err := iter.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		// state.json is expected - it's for resume
+		if strings.HasSuffix(obj.Key, "state.json") {
+			continue
+		}
+		partialChunks = append(partialChunks, obj.Key)
+	}
+
+	if len(partialChunks) > 0 {
+		t.Errorf("expected no partial chunks in bucket, found: %v", partialChunks)
+		for _, key := range partialChunks {
+			data, _ := bucket.ReadAll(ctx, key)
+			t.Logf("  %s: %d bytes", key, len(data))
+		}
+	}
+}
