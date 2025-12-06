@@ -7,20 +7,37 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
 
 	"gocloud.dev/blob"
 )
 
+// chunkResult holds the result of fetching a chunk.
+type chunkResult struct {
+	reader io.ReadCloser
+	err    error
+}
+
 // Reader reads a sharded file, streaming all chunks in order.
 type Reader struct {
-	bucket   *blob.Bucket
-	manifest *Manifest
-	opts     Options
+	bucket    *blob.Bucket
+	ownBucket bool // true if we opened the bucket and should close it
+	manifest  *Manifest
+	opts      Options
 
 	currentChunk   int
 	currentReader  io.ReadCloser
 	checksumReader *checksumReader
 	closed         bool
+
+	// Prefetch support: worker pool with per-chunk result channels
+	prefetchCount int
+	prefetchCtx   context.Context
+	prefetchStop  context.CancelFunc
+	prefetchOnce  sync.Once
+	prefetchWg    sync.WaitGroup
+	workCh        chan int           // chunk indices to fetch
+	results       []chan chunkResult // result channel per chunk
 }
 
 // Read opens a sharded file for reading.
@@ -31,7 +48,13 @@ func Read(ctx context.Context, bucketURL string, dest string, options ...Option)
 		return nil, fmt.Errorf("sharded: open bucket: %w", err)
 	}
 
-	return ReadFromBucket(ctx, bucket, dest, options...)
+	reader, err := ReadFromBucket(ctx, bucket, dest, options...)
+	if err != nil {
+		bucket.Close()
+		return nil, err
+	}
+	reader.ownBucket = true
+	return reader, nil
 }
 
 // ReadFromBucket opens a sharded file from an existing bucket handle.
@@ -53,11 +76,76 @@ func ReadFromBucket(ctx context.Context, bucket *blob.Bucket, dest string, optio
 		return nil, fmt.Errorf("sharded: unmarshal manifest: %w", err)
 	}
 
-	return &Reader{
-		bucket:   bucket,
-		manifest: &manifest,
-		opts:     opts,
-	}, nil
+	r := &Reader{
+		bucket:        bucket,
+		manifest:      &manifest,
+		opts:          opts,
+		prefetchCount: opts.PrefetchCount,
+	}
+
+	return r, nil
+}
+
+// startPrefetch initializes the prefetch worker pool.
+func (r *Reader) startPrefetch() {
+	if r.prefetchCount <= 0 {
+		return
+	}
+
+	r.prefetchCtx, r.prefetchStop = context.WithCancel(context.Background())
+	r.workCh = make(chan int, r.prefetchCount)
+
+	// Create a result channel for each chunk
+	r.results = make([]chan chunkResult, len(r.manifest.Chunks))
+	for i := range r.results {
+		r.results[i] = make(chan chunkResult, 1)
+	}
+
+	// Start worker pool
+	for i := 0; i < r.prefetchCount; i++ {
+		r.prefetchWg.Add(1)
+		go r.prefetchWorker()
+	}
+
+	// Queue all chunks for prefetching
+	go r.queueChunks()
+}
+
+// prefetchWorker fetches chunks from the work channel.
+func (r *Reader) prefetchWorker() {
+	defer r.prefetchWg.Done()
+
+	for {
+		select {
+		case <-r.prefetchCtx.Done():
+			return
+		case idx, ok := <-r.workCh:
+			if !ok {
+				return
+			}
+			reader, err := r.openChunkWithCtx(r.prefetchCtx, idx)
+			select {
+			case r.results[idx] <- chunkResult{reader: reader, err: err}:
+			case <-r.prefetchCtx.Done():
+				if reader != nil {
+					reader.Close()
+				}
+				return
+			}
+		}
+	}
+}
+
+// queueChunks sends all chunk indices to the work channel.
+func (r *Reader) queueChunks() {
+	defer close(r.workCh)
+	for i := 0; i < len(r.manifest.Chunks); i++ {
+		select {
+		case <-r.prefetchCtx.Done():
+			return
+		case r.workCh <- i:
+		}
+	}
 }
 
 // Read reads data from the sharded file.
@@ -65,6 +153,9 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	if r.closed {
 		return 0, io.ErrClosedPipe
 	}
+
+	// Start prefetch on first read
+	r.prefetchOnce.Do(r.startPrefetch)
 
 	for {
 		// If we have a current reader, try to read from it
@@ -99,12 +190,21 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 			return 0, io.EOF
 		}
 
-		chunk := r.manifest.Chunks[r.currentChunk]
-		path := r.manifest.PartsPrefix + chunk.Object
+		var reader io.ReadCloser
 
-		reader, err := r.bucket.NewReader(context.Background(), path, nil)
-		if err != nil {
-			return 0, fmt.Errorf("sharded: open chunk %d: %w", r.currentChunk, err)
+		// Get chunk - either from prefetch result channel or synchronously
+		if r.results != nil {
+			result := <-r.results[r.currentChunk]
+			if result.err != nil {
+				return 0, fmt.Errorf("sharded: open chunk %d: %w", r.currentChunk, result.err)
+			}
+			reader = result.reader
+		} else {
+			// No prefetching, open synchronously
+			reader, err = r.openChunk(r.currentChunk)
+			if err != nil {
+				return 0, err
+			}
 		}
 
 		r.currentReader = reader
@@ -120,6 +220,23 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	}
 }
 
+// openChunk opens a chunk synchronously.
+func (r *Reader) openChunk(idx int) (io.ReadCloser, error) {
+	return r.openChunkWithCtx(context.Background(), idx)
+}
+
+// openChunkWithCtx opens a chunk with a context for cancellation.
+func (r *Reader) openChunkWithCtx(ctx context.Context, idx int) (io.ReadCloser, error) {
+	chunk := r.manifest.Chunks[idx]
+	path := r.manifest.PartsPrefix + chunk.Object
+
+	reader, err := r.bucket.NewReader(ctx, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sharded: open chunk %d: %w", idx, err)
+	}
+	return reader, nil
+}
+
 // Close closes the reader and releases resources.
 func (r *Reader) Close() error {
 	if r.closed {
@@ -127,12 +244,34 @@ func (r *Reader) Close() error {
 	}
 	r.closed = true
 
+	// Stop prefetch workers
+	if r.prefetchStop != nil {
+		r.prefetchStop()
+		r.prefetchWg.Wait()
+
+		// Drain and close any prefetched readers that weren't consumed
+		for i := r.currentChunk; i < len(r.results); i++ {
+			select {
+			case result := <-r.results[i]:
+				if result.reader != nil {
+					result.reader.Close()
+				}
+			default:
+				// No result yet, worker was cancelled
+			}
+		}
+	}
+
 	if r.currentReader != nil {
 		r.currentReader.Close()
 		r.currentReader = nil
 	}
 
-	return r.bucket.Close()
+	// Only close the bucket if we opened it
+	if r.ownBucket {
+		return r.bucket.Close()
+	}
+	return nil
 }
 
 // Manifest returns the manifest for the sharded file.

@@ -59,6 +59,7 @@ type Options struct {
 	Metadata       map[string]string
 	VerifyChecksum bool
 	StateInterval  int // Persist state every N completed chunks
+	PrefetchCount  int // Number of chunks to prefetch ahead (0 = disabled)
 }
 
 // Option is a functional option for configuring sharded operations.
@@ -97,6 +98,15 @@ func WithVerifyChecksum(verify bool) Option {
 func WithStateInterval(n int) Option {
 	return func(o *Options) {
 		o.StateInterval = n
+	}
+}
+
+// WithPrefetch sets the number of chunks to prefetch ahead during reads.
+// This can improve read performance by overlapping I/O with processing.
+// Set to 0 to disable prefetching (default).
+func WithPrefetch(n int) Option {
+	return func(o *Options) {
+		o.PrefetchCount = n
 	}
 }
 
