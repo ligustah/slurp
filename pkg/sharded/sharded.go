@@ -39,7 +39,7 @@ type ChunkInfo struct {
 	Index    int    `json:"index"`
 	Object   string `json:"object"`
 	Size     int64  `json:"size"`
-	Checksum string `json:"checksum"`
+	Checksum string `json:"checksum,omitempty"`
 }
 
 // state tracks write progress for resume support.
@@ -54,12 +54,13 @@ type state struct {
 
 // Options configures sharded file operations.
 type Options struct {
-	ChunkSize      int64
-	Size           int64
-	Metadata       map[string]string
-	VerifyChecksum bool
-	StateInterval  int // Persist state every N completed chunks
-	PrefetchCount  int // Number of chunks to prefetch ahead (0 = disabled)
+	ChunkSize       int64
+	Size            int64
+	Metadata        map[string]string
+	VerifyChecksum  bool
+	ComputeChecksum bool // Compute checksums during writes (default: true)
+	StateInterval   int  // Persist state every N completed chunks
+	PrefetchCount   int  // Number of chunks to prefetch ahead (0 = disabled)
 }
 
 // Option is a functional option for configuring sharded operations.
@@ -88,9 +89,23 @@ func WithMetadata(metadata map[string]string) Option {
 }
 
 // WithVerifyChecksum enables checksum verification during reads.
+// When enabled and a chunk has no stored checksum, verification is skipped for that chunk.
 func WithVerifyChecksum(verify bool) Option {
 	return func(o *Options) {
 		o.VerifyChecksum = verify
+	}
+}
+
+// WithChecksum enables or disables SHA256 checksum computation during writes.
+// When disabled, chunks are written without computing checksums, which improves
+// write performance but prevents later verification with WithVerifyChecksum.
+// Default is true (checksums enabled).
+//
+// Disabling checksums is useful when relying on object store integrity guarantees
+// (e.g., S3/GCS built-in checksums) and write performance is critical.
+func WithChecksum(compute bool) Option {
+	return func(o *Options) {
+		o.ComputeChecksum = compute
 	}
 }
 
@@ -129,7 +144,8 @@ type File struct {
 // If state exists from a previous incomplete write, it will be loaded for resume.
 func Write(ctx context.Context, bucket *blob.Bucket, dest string, options ...Option) (*File, error) {
 	opts := Options{
-		StateInterval: 10, // Default: persist state every 10 chunks
+		StateInterval:   10,   // Default: persist state every 10 chunks
+		ComputeChecksum: true, // Default: compute checksums
 	}
 	for _, opt := range options {
 		opt(&opts)
@@ -286,10 +302,11 @@ func (f *File) Next(ctx context.Context) (*Chunk, error) {
 	}
 
 	chunk := &Chunk{
-		file:   f,
-		index:  idx,
-		offset: offset,
-		length: length,
+		file:            f,
+		index:           idx,
+		offset:          offset,
+		length:          length,
+		computeChecksum: f.opts.ComputeChecksum,
 	}
 
 	// Check if this chunk was already written
@@ -368,11 +385,12 @@ func (f *File) TotalChunks() int {
 
 // Chunk represents a single chunk being written.
 type Chunk struct {
-	file   *File
-	index  int
-	offset int64
-	length int64
-	info   *ChunkInfo // Set if chunk was already filled
+	file            *File
+	index           int
+	offset          int64
+	length          int64
+	computeChecksum bool
+	info            *ChunkInfo // Set if chunk was already filled
 
 	mu     sync.Mutex
 	writer *blob.Writer
@@ -416,7 +434,9 @@ func (c *Chunk) Write(p []byte) (n int, err error) {
 			return 0, fmt.Errorf("create chunk writer: %w", err)
 		}
 		c.writer = w
-		c.hash = &sha256Writer{hash: sha256.New()}
+		if c.computeChecksum {
+			c.hash = &sha256Writer{hash: sha256.New()}
+		}
 	}
 
 	n, err = c.writer.Write(p)
@@ -424,7 +444,9 @@ func (c *Chunk) Write(p []byte) (n int, err error) {
 		return n, err
 	}
 
-	c.hash.Write(p[:n])
+	if c.hash != nil {
+		c.hash.Write(p[:n])
+	}
 	c.size += int64(n)
 
 	return n, nil
@@ -457,10 +479,12 @@ func (c *Chunk) Close() error {
 	// Update state
 	objectName := fmt.Sprintf("chunk-%04d", c.index)
 	info := ChunkInfo{
-		Index:    c.index,
-		Object:   objectName,
-		Size:     c.size,
-		Checksum: c.hash.Sum(),
+		Index:  c.index,
+		Object: objectName,
+		Size:   c.size,
+	}
+	if c.hash != nil {
+		info.Checksum = c.hash.Sum()
 	}
 
 	c.file.mu.Lock()

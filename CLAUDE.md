@@ -4,31 +4,45 @@
 
 **CRITICAL: You MUST follow this exact workflow. No shortcuts.**
 
-1. **Create placeholder functions with documentation**
-   - Write function signatures with precise, concise doc comments
-   - Document the contract before implementing
-   - NO implementation code yet - just signatures and docs
+### Step 1: Create STUB functions with documentation
+- Write function signature with precise, concise doc comment
+- **Document what errors can be returned and under which circumstances**
+- **Reference specific error types (sentinel errors like ErrNotFound, io.EOF, context.Canceled)**
+- Body should be minimal: `panic("not implemented")` or `return errors.New("not implemented")`
+- This defines the CONTRACT before any implementation
+- Example:
+  ```go
+  // Delete removes a sharded file and all its chunks from storage.
+  //
+  // Returns an error if:
+  //   - The manifest doesn't exist (wraps gcerrors.NotFound)
+  //   - A chunk cannot be deleted (permission, network error)
+  //   - The context is cancelled (context.Canceled or context.DeadlineExceeded)
+  func Delete(ctx context.Context, bucket *blob.Bucket, dest string) error {
+      panic("not implemented")
+  }
+  ```
 
-2. **Write tests FIRST - before ANY implementation**
-   - Create tests that verify the documented behavior
-   - Use table-driven tests for multiple scenarios
-   - **IMMEDIATELY run tests to confirm they FAIL**
-   - If tests pass without implementation, the tests are wrong - fix them
+### Step 2: Write tests FIRST
+- Create tests that verify the documented behavior
+- Use table-driven tests for multiple scenarios
+- **Run tests immediately - they MUST FAIL** (panic or error)
+- If tests pass without implementation, tests are wrong
 
-3. **Implement incrementally with continuous verification**
-   - Add SMALL pieces of implementation (one function/method at a time)
-   - **Run tests after EVERY change** - this is not optional
-   - Watch the test output change from failing to passing
-   - Stop implementing when tests pass - do not add extra code
+### Step 3: Implement the function
+- Replace panic/error stub with real implementation
+- **Run tests after implementation**
+- Watch tests change from failing to passing
 
-4. **When tests fail, think VERY HARD**
-   - Is the expectation wrong or the implementation bad?
-   - Do not blindly change code - understand the failure first
+### Step 4: Verify and refine
+- If tests fail, think HARD: is expectation wrong or implementation bad?
+- Do not blindly change code - understand the failure first
+- Stop implementing when tests pass - do not add extra code
 
-5. **Keep it simple**
-   - Strongly prefer simpler implementations over complex logic
-   - Don't over-engineer
-   - If you haven't run `go test` in the last 2 tool calls, you're doing it wrong
+### Step 5: Keep it simple
+- Prefer simpler implementations over complex logic
+- Don't over-engineer
+- If you haven't run `go test` in the last 2-3 tool calls, you're doing it wrong
 
 ## Tool Preferences
 

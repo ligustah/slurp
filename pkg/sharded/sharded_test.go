@@ -303,6 +303,126 @@ func TestChecksumVerification(t *testing.T) {
 	}
 }
 
+func TestWriteWithoutChecksum(t *testing.T) {
+	ctx := context.Background()
+	bucket, err := blob.OpenBucket(ctx, "mem://")
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	defer bucket.Close()
+
+	data := []byte("test data without checksum computation")
+	chunkSize := int64(20)
+
+	// Write with checksums disabled
+	f, err := Write(ctx, bucket, "test/no-checksum.bin",
+		WithChunkSize(chunkSize),
+		WithSize(int64(len(data))),
+		WithChecksum(false),
+	)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	for {
+		chunk, err := f.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+
+		start := chunk.Offset()
+		end := start + chunk.Length()
+		if end > int64(len(data)) {
+			end = int64(len(data))
+		}
+		chunk.Write(data[start:end])
+		chunk.Close()
+	}
+	f.Complete(ctx)
+
+	// Read manifest and verify no checksums
+	reader, err := ReadFromBucket(ctx, bucket, "test/no-checksum.bin")
+	if err != nil {
+		t.Fatalf("ReadFromBucket: %v", err)
+	}
+
+	manifest := reader.Manifest()
+	for i, chunk := range manifest.Chunks {
+		if chunk.Checksum != "" {
+			t.Errorf("chunk %d has checksum %q, expected empty", i, chunk.Checksum)
+		}
+	}
+
+	// Verify data is still correct
+	result, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(result, data) {
+		t.Fatalf("data mismatch")
+	}
+}
+
+func TestReadWithVerificationSkipsEmptyChecksums(t *testing.T) {
+	ctx := context.Background()
+	bucket, err := blob.OpenBucket(ctx, "mem://")
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	defer bucket.Close()
+
+	data := []byte("data written without checksums")
+	chunkSize := int64(15)
+
+	// Write without checksums
+	f, err := Write(ctx, bucket, "test/verify-skip.bin",
+		WithChunkSize(chunkSize),
+		WithSize(int64(len(data))),
+		WithChecksum(false),
+	)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	for {
+		chunk, err := f.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+
+		start := chunk.Offset()
+		end := start + chunk.Length()
+		if end > int64(len(data)) {
+			end = int64(len(data))
+		}
+		chunk.Write(data[start:end])
+		chunk.Close()
+	}
+	f.Complete(ctx)
+
+	// Read with verification enabled - should NOT error, just skip verification
+	reader, err := ReadFromBucket(ctx, bucket, "test/verify-skip.bin",
+		WithVerifyChecksum(true),
+	)
+	if err != nil {
+		t.Fatalf("ReadFromBucket: %v", err)
+	}
+
+	result, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll with verify checksum: %v", err)
+	}
+	if !bytes.Equal(result, data) {
+		t.Fatalf("data mismatch")
+	}
+}
+
 func TestStreamingMode(t *testing.T) {
 	ctx := context.Background()
 	bucket, err := blob.OpenBucket(ctx, "mem://")

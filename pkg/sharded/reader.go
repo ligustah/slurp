@@ -162,13 +162,15 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		if r.currentReader != nil {
 			n, err = r.currentReader.Read(p)
 			if err == io.EOF {
-				// Verify checksum if enabled
+				// Verify checksum if enabled and chunk has a stored checksum
 				if r.opts.VerifyChecksum && r.checksumReader != nil {
 					expected := r.manifest.Chunks[r.currentChunk-1].Checksum
-					actual := r.checksumReader.Sum()
-					if expected != actual {
-						return 0, fmt.Errorf("sharded: checksum mismatch for chunk %d: expected %s, got %s",
-							r.currentChunk-1, expected, actual)
+					if expected != "" { // Skip verification for chunks without checksums
+						actual := r.checksumReader.Sum()
+						if expected != actual {
+							return 0, fmt.Errorf("sharded: checksum mismatch for chunk %d: expected %s, got %s",
+								r.currentChunk-1, expected, actual)
+						}
 					}
 				}
 

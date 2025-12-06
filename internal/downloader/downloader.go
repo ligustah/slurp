@@ -33,6 +33,38 @@ type Options struct {
 
 	// HTTPOptions configures the HTTP client.
 	HTTPOptions slurphttp.Options
+
+	// MaxConsecutiveFailures is the number of consecutive chunk failures
+	// before the circuit breaker trips and stops the download.
+	// Set to 0 to disable (default: 10).
+	MaxConsecutiveFailures int
+
+	// NoChecksum disables SHA256 checksum computation during writes.
+	// This improves write performance when relying on object store integrity.
+	NoChecksum bool
+}
+
+// FailedChunk records information about a chunk that failed to download.
+type FailedChunk struct {
+	Index int   // Chunk index
+	Error error // The error that occurred
+}
+
+// CircuitBreakerError is returned when too many consecutive failures occur.
+// It contains details about the failures that triggered the circuit breaker.
+//
+// This error is returned when:
+//   - MaxConsecutiveFailures consecutive chunk downloads fail
+//   - The circuit breaker threshold is exceeded
+//
+// Use errors.As to extract this error and inspect FailedChunks for details.
+type CircuitBreakerError struct {
+	ConsecutiveFailures int           // Number of consecutive failures
+	FailedChunks        []FailedChunk // Details of failed chunks
+}
+
+func (e *CircuitBreakerError) Error() string {
+	return fmt.Sprintf("circuit breaker tripped: %d consecutive failures", e.ConsecutiveFailures)
 }
 
 // FileInfo contains metadata about the remote file.
@@ -72,6 +104,9 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	if opts.StateInterval <= 0 {
 		opts.StateInterval = 10
 	}
+	if opts.MaxConsecutiveFailures <= 0 {
+		opts.MaxConsecutiveFailures = 10
+	}
 	if opts.HTTPOptions.MaxIdleConnsPerHost == 0 {
 		opts.HTTPOptions = slurphttp.DefaultOptions()
 	}
@@ -98,6 +133,7 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 			"source_etag": info.ETag,
 		}),
 		sharded.WithStateInterval(opts.StateInterval),
+		sharded.WithChecksum(!opts.NoChecksum),
 	)
 	if err != nil {
 		return fmt.Errorf("create sharded file: %w", err)
@@ -121,14 +157,24 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 		}
 	}
 
+	// Circuit breaker state
+	var (
+		cbMu                  sync.Mutex
+		consecutiveFailures   int
+		failedChunks          []FailedChunk
+		circuitBreakerTripped bool
+	)
+
+	// Create cancellable context for circuit breaker
+	cbCtx, cbCancel := context.WithCancel(ctx)
+	defer cbCancel()
+
 	// Create worker pool
 	type chunkJob struct {
 		chunk *sharded.Chunk
 	}
 
 	jobs := make(chan chunkJob, opts.Workers)
-	errCh := make(chan error, 1)
-
 	var wg sync.WaitGroup
 
 	// Start workers
@@ -137,11 +183,27 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				if err := downloadChunk(ctx, client, url, job.chunk, opts.Progress); err != nil {
-					select {
-					case errCh <- err:
-					default:
+				err := downloadChunk(cbCtx, client, url, job.chunk, opts.Progress)
+
+				cbMu.Lock()
+				if err != nil {
+					consecutiveFailures++
+					failedChunks = append(failedChunks, FailedChunk{
+						Index: job.chunk.Index(),
+						Error: err,
+					})
+
+					if consecutiveFailures >= opts.MaxConsecutiveFailures {
+						circuitBreakerTripped = true
+						cbCancel() // Stop all workers
 					}
+				} else {
+					consecutiveFailures = 0 // Reset on success
+				}
+				tripped := circuitBreakerTripped
+				cbMu.Unlock()
+
+				if tripped {
 					return
 				}
 			}
@@ -152,7 +214,7 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	go func() {
 		defer close(jobs)
 		for {
-			chunk, err := f.Next(ctx)
+			chunk, err := f.Next(cbCtx)
 			if err == io.EOF {
 				return
 			}
@@ -160,16 +222,12 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 				continue // Skip already-completed chunks
 			}
 			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
 				return
 			}
 
 			select {
 			case jobs <- chunkJob{chunk: chunk}:
-			case <-ctx.Done():
+			case <-cbCtx.Done():
 				return
 			}
 		}
@@ -178,12 +236,17 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	// Wait for completion
 	wg.Wait()
 
-	// Check for errors
-	select {
-	case err := <-errCh:
-		return err
-	default:
+	// Check circuit breaker
+	cbMu.Lock()
+	if circuitBreakerTripped {
+		cbErr := &CircuitBreakerError{
+			ConsecutiveFailures: consecutiveFailures,
+			FailedChunks:        failedChunks,
+		}
+		cbMu.Unlock()
+		return cbErr
 	}
+	cbMu.Unlock()
 
 	// Check context
 	if ctx.Err() != nil {
