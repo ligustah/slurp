@@ -27,9 +27,11 @@ type Options struct {
 	// Default: 100
 	MaxIdleConnsPerHost int
 
-	// Timeout for individual requests.
+	// ResponseHeaderTimeout is the timeout for waiting for response headers.
+	// This does NOT include time to read the body, making it suitable for
+	// streaming large downloads.
 	// Default: 30s
-	Timeout time.Duration
+	ResponseHeaderTimeout time.Duration
 
 	// RetryAttempts is the maximum number of retry attempts.
 	// Default: 5
@@ -47,11 +49,11 @@ type Options struct {
 // DefaultOptions returns options with sensible defaults.
 func DefaultOptions() Options {
 	return Options{
-		MaxIdleConnsPerHost: 100,
-		Timeout:             30 * time.Second,
-		RetryAttempts:       5,
-		RetryBackoff:        time.Second,
-		RetryMaxBackoff:     30 * time.Second,
+		MaxIdleConnsPerHost:   100,
+		ResponseHeaderTimeout: 30 * time.Second,
+		RetryAttempts:         5,
+		RetryBackoff:          time.Second,
+		RetryMaxBackoff:       30 * time.Second,
 	}
 }
 
@@ -80,16 +82,19 @@ type Client struct {
 // NewClient creates a new HTTP client with the given options.
 func NewClient(opts Options) *Client {
 	transport := &http.Transport{
-		MaxIdleConnsPerHost: opts.MaxIdleConnsPerHost,
-		MaxIdleConns:        opts.MaxIdleConnsPerHost * 2,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  true, // We want raw bytes for range requests
+		MaxIdleConnsPerHost:   opts.MaxIdleConnsPerHost,
+		MaxIdleConns:          opts.MaxIdleConnsPerHost * 2,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: opts.ResponseHeaderTimeout,
+		DisableCompression:    true, // We want raw bytes for range requests
 	}
 
 	return &Client{
 		client: &http.Client{
 			Transport: transport,
-			Timeout:   opts.Timeout,
+			// No Timeout set - we use ResponseHeaderTimeout on transport for
+			// connection/header timeout, and let body reads be unlimited.
+			// Context cancellation handles user-initiated cancellation.
 		},
 		opts: opts,
 	}

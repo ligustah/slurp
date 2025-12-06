@@ -483,8 +483,8 @@ func TestTimeoutMidDownload(t *testing.T) {
 		MaxConsecutiveFailures: 2,
 		StateInterval:          1,
 		HTTPOptions: slurphttp.Options{
-			RetryAttempts: 0,                      // No retries
-			Timeout:       300 * time.Millisecond, // Very short timeout
+			RetryAttempts:         0,                      // No retries
+			ResponseHeaderTimeout: 300 * time.Millisecond, // Very short timeout
 		},
 	})
 
@@ -570,8 +570,8 @@ func TestPartialHTTPResponse(t *testing.T) {
 		MaxConsecutiveFailures: 2, // Trip quickly
 		StateInterval:          1,
 		HTTPOptions: slurphttp.Options{
-			RetryAttempts: 0, // No retries - fail immediately
-			Timeout:       5 * time.Second,
+			RetryAttempts:         0, // No retries - fail immediately
+			ResponseHeaderTimeout: 5 * time.Second,
 		},
 	})
 

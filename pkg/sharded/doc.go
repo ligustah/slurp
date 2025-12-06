@@ -36,17 +36,17 @@
 //
 // # Storage Layout
 //
-//	{bucket}/.sharded/{dest-hash}/chunk-000000
-//	{bucket}/.sharded/{dest-hash}/chunk-000001
-//	{bucket}/.sharded/{dest-hash}/state.json     (during writes)
-//	{bucket}/{dest}.manifest.json                (on completion)
+//	{bucket}/{dest}.shards/chunk-000000
+//	{bucket}/{dest}.shards/chunk-000001
+//	{bucket}/{dest}.shards/state.json     (during writes, deleted on completion)
+//	{bucket}/{dest}.manifest.json         (on completion)
 //
 // # Manifest Format
 //
 //	{
 //	  "total_size": 1073741824,
 //	  "chunk_size": 268435456,
-//	  "parts_prefix": ".sharded/abc123def/",
+//	  "parts_prefix": "path/to/file.bin.shards/",
 //	  "chunks": [
 //	    {"index": 0, "object": "chunk-000000", "size": 268435456, "checksum": "..."},
 //	    ...

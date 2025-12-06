@@ -2,8 +2,6 @@ package sharded
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
@@ -56,9 +54,8 @@ func Delete(ctx context.Context, bucket *blob.Bucket, dest string) error {
 //   - A chunk cannot be deleted (permission denied, network error)
 //   - The context is cancelled (context.Canceled or context.DeadlineExceeded)
 func DeletePartial(ctx context.Context, bucket *blob.Bucket, dest string) error {
-	// Calculate parts prefix from destination hash (same logic as Write)
-	hash := sha256.Sum256([]byte(dest))
-	partsPrefix := ".sharded/" + hex.EncodeToString(hash[:8]) + "/"
+	// Use destination-based prefix (same logic as Write)
+	partsPrefix := dest + ".shards/"
 
 	// Try to read state file for chunk info
 	statePath := partsPrefix + "state.json"

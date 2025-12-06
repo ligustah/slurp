@@ -115,6 +115,14 @@ func (r *Reporter) BytesWritten(n int64) {
 	r.completedBytes.Add(n)
 }
 
+// SetResumeState sets the initial progress when resuming a download.
+// Call this before Start() to show accurate progress from the beginning.
+func (r *Reporter) SetResumeState(completedChunks int, completedBytes int64) {
+	r.completedChunks.Store(int32(completedChunks))
+	r.completedBytes.Store(completedBytes)
+	r.lastBytes = completedBytes
+}
+
 // updateLoop periodically logs progress.
 func (r *Reporter) updateLoop() {
 	defer close(r.doneCh)

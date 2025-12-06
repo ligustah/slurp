@@ -176,9 +176,8 @@ func Write(ctx context.Context, bucket *blob.Bucket, dest string, options ...Opt
 		return nil, errors.New("sharded: chunk size must be positive")
 	}
 
-	// Generate parts prefix from destination hash
-	hash := sha256.Sum256([]byte(dest))
-	partsPrefix := ".sharded/" + hex.EncodeToString(hash[:8]) + "/"
+	// Use destination-based prefix for shards
+	partsPrefix := dest + ".shards/"
 
 	f := &File{
 		bucket:       bucket,
@@ -315,7 +314,13 @@ func (f *File) Reset(ctx context.Context) error {
 // Next returns the next chunk to be written.
 // Returns ErrChunkFilled if the chunk was already written (resume case).
 // Returns io.EOF when all chunks have been accounted for (requires WithSize).
+// Returns context error if the context is cancelled.
 func (f *File) Next(ctx context.Context) (*Chunk, error) {
+	// Check context first to avoid marking chunks as in_progress during shutdown
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -446,6 +451,19 @@ func (f *File) CompletedCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.completedCount
+}
+
+// CompletedBytes returns the total bytes of all completed chunks.
+func (f *File) CompletedBytes() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var total int64
+	for _, cs := range f.state.Chunks {
+		if cs.Status == ChunkCompleted {
+			total += cs.Size
+		}
+	}
+	return total
 }
 
 // TotalChunks returns the total number of chunks, or 0 if size is unknown.

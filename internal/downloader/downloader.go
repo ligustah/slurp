@@ -167,6 +167,11 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 		}
 	}
 
+	// Set resume state on progress reporter if resuming
+	if opts.Progress != nil && f.CompletedCount() > 0 {
+		opts.Progress.SetResumeState(f.CompletedCount(), f.CompletedBytes())
+	}
+
 	// Circuit breaker state
 	var (
 		cbMu                  sync.Mutex
@@ -181,6 +186,7 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 
 	// Start background state saver goroutine
 	stateSaverDone := make(chan struct{})
+	stateSaverStop := make(chan struct{})
 	go func() {
 		defer close(stateSaverDone)
 		ticker := time.NewTicker(opts.StateSaveInterval)
@@ -197,9 +203,10 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 					}
 					// Ignore errors - eventual consistency
 				}
-			case <-cbCtx.Done():
-				// Final save before exit
-				if err := f.SaveState(ctx); err != nil {
+			case <-stateSaverStop:
+				// Final save after all workers are done - use background context
+				// since the parent context may be cancelled
+				if err := f.SaveState(context.Background()); err != nil {
 					slog.Warn("failed to save final state", "error", err)
 				}
 				return
@@ -225,16 +232,19 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 
 				cbMu.Lock()
 				if err != nil {
-					slog.Warn("chunk failed", "chunk", job.chunk.Index(), "error", err)
-					consecutiveFailures++
-					failedChunks = append(failedChunks, FailedChunk{
-						Index: job.chunk.Index(),
-						Error: err,
-					})
+					// Only log and track failures if not shutting down
+					if ctx.Err() == nil {
+						slog.Warn("chunk failed", "chunk", job.chunk.Index(), "error", err)
+						consecutiveFailures++
+						failedChunks = append(failedChunks, FailedChunk{
+							Index: job.chunk.Index(),
+							Error: err,
+						})
 
-					if consecutiveFailures >= opts.MaxConsecutiveFailures {
-						circuitBreakerTripped = true
-						cbCancel() // Stop all workers
+						if consecutiveFailures >= opts.MaxConsecutiveFailures {
+							circuitBreakerTripped = true
+							cbCancel() // Stop all workers
+						}
 					}
 				} else {
 					consecutiveFailures = 0 // Reset on success
@@ -281,8 +291,8 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	// Wait for completion
 	wg.Wait()
 
-	// Signal state saver to do final save and exit
-	cbCancel()
+	// Signal state saver to do final save and exit (after workers have called Abort())
+	close(stateSaverStop)
 	<-stateSaverDone
 
 	// Check circuit breaker
@@ -318,6 +328,12 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 // downloadChunk downloads a single chunk with resume support.
 // If the connection drops mid-download, it will retry from where it left off.
 func downloadChunk(ctx context.Context, client *slurphttp.Client, url string, chunk *sharded.Chunk, reporter *progress.Reporter) error {
+	// Early exit if context already cancelled (shutdown in progress)
+	if ctx.Err() != nil {
+		chunk.Abort()
+		return ctx.Err()
+	}
+
 	if reporter != nil {
 		reporter.ChunkStarted()
 	}

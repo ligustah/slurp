@@ -122,11 +122,11 @@ Options:`)
 		Force:         *force,
 		NoChecksum:    *noChecksum,
 		HTTPOptions: slurphttp.Options{
-			MaxIdleConnsPerHost: *workers * 2,
-			Timeout:             30 * time.Second,
-			RetryAttempts:       *retryAttempts,
-			RetryBackoff:        *retryBackoff,
-			RetryMaxBackoff:     *retryMaxBackoff,
+			MaxIdleConnsPerHost:   *workers * 2,
+			ResponseHeaderTimeout: 30 * time.Second,
+			RetryAttempts:         *retryAttempts,
+			RetryBackoff:          *retryBackoff,
+			RetryMaxBackoff:       *retryMaxBackoff,
 		},
 	})
 

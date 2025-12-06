@@ -10,9 +10,9 @@
 // # Usage
 //
 //	client := http.NewClient(Options{
-//	    MaxIdleConnsPerHost: 100,
-//	    Timeout:             30 * time.Second,
-//	    RetryAttempts:       5,
+//	    MaxIdleConnsPerHost:   100,
+//	    ResponseHeaderTimeout: 30 * time.Second,
+//	    RetryAttempts:         5,
 //	})
 //
 //	// Get file info
