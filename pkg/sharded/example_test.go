@@ -9,7 +9,7 @@ import (
 	"gocloud.dev/blob"
 	_ "gocloud.dev/blob/memblob"
 
-	"github.com/username/slurp/pkg/sharded"
+	"github.com/ligustah/slurp/pkg/sharded"
 )
 
 func Example_writeWithKnownSize() {

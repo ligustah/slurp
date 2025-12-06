@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "gopls": {
+      "type": "stdio",
+      "command": "gopls",
+      "args": [
+        "mcp"
+      ],
+      "env": {}
+    },
+    "delve": {
+      "type": "stdio",
+      "command": "dlv-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

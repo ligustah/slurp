@@ -1,23 +1,34 @@
 # Development Guidelines
 
-## Development Process
+## Development Process (STRICT TDD - MANDATORY!)
+
+**CRITICAL: You MUST follow this exact workflow. No shortcuts.**
 
 1. **Create placeholder functions with documentation**
    - Write function signatures with precise, concise doc comments
    - Document the contract before implementing
+   - NO implementation code yet - just signatures and docs
 
-2. **Write tests first**
+2. **Write tests FIRST - before ANY implementation**
    - Create tests that verify the documented behavior
    - Use table-driven tests for multiple scenarios
+   - **IMMEDIATELY run tests to confirm they FAIL**
+   - If tests pass without implementation, the tests are wrong - fix them
 
-3. **Implement and verify**
-   - Fill in the method body
-   - Run tests to verify behavior
-   - If tests fail, think _VERY HARD_: is the expectation wrong or the implementation bad?
+3. **Implement incrementally with continuous verification**
+   - Add SMALL pieces of implementation (one function/method at a time)
+   - **Run tests after EVERY change** - this is not optional
+   - Watch the test output change from failing to passing
+   - Stop implementing when tests pass - do not add extra code
 
-4. **Keep it simple**
+4. **When tests fail, think VERY HARD**
+   - Is the expectation wrong or the implementation bad?
+   - Do not blindly change code - understand the failure first
+
+5. **Keep it simple**
    - Strongly prefer simpler implementations over complex logic
    - Don't over-engineer
+   - If you haven't run `go test` in the last 2 tool calls, you're doing it wrong
 
 ## Tool Preferences
 
