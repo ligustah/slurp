@@ -1,43 +1,43 @@
 // Package sharded provides types for reading and writing sharded files in cloud storage.
 //
-// This package enables storing large files as multiple chunks in cloud storage
+// This package enables storing large files as multiple shards in cloud storage
 // with a manifest for reassembly. It handles state persistence for resumable
 // operations and is storage-agnostic via gocloud.dev/blob.
 //
 // # Writing
 //
-// Use [Write] to create a sharded file. Call [File.Next] to get successive chunks,
-// write data to each chunk, then call [File.Complete] to finalize.
+// Use [Write] to create a sharded file. Call [File.Next] to get successive shards,
+// write data to each shard, then call [File.Complete] to finalize.
 //
 // Options:
-//   - [WithChunkSize]: Size of each chunk (required)
-//   - [WithSize]: Total size, enables io.EOF when all chunks filled (optional)
+//   - [WithShardSize]: Size of each shard (required)
+//   - [WithSize]: Total size, enables io.EOF when all shards filled (optional)
 //   - [WithMetadata]: Caller-defined metadata stored in manifest (optional)
 //
 // # Resume
 //
 // The same [Write] call handles resume automatically. If state exists from a
-// previous incomplete write, [File.Next] returns [ErrChunkFilled] for chunks
+// previous incomplete write, [File.Next] returns [ErrShardFilled] for shards
 // already written. Use [File.Metadata] to validate stored metadata (e.g., check
 // source ETag hasn't changed). Call [File.Reset] to discard state and start over.
 //
-// # Chunk
+// # Shard
 //
-// [File.Next] returns a [Chunk] which provides:
-//   - Index: Chunk number (0, 1, 2, ...)
+// [File.Next] returns a [Shard] which provides:
+//   - Index: Shard number (0, 1, 2, ...)
 //   - Offset: Byte offset in the source data
-//   - Length: Expected size of this chunk
+//   - Length: Expected size of this shard
 //   - io.WriteCloser: Write data and Close to persist
 //
 // # Reading
 //
 // Use [Read] to open a sharded file. It returns an io.ReadCloser that streams
-// all chunks in order, transparently handling the manifest.
+// all shards in order, transparently handling the manifest.
 //
 // # Storage Layout
 //
-//	{bucket}/{dest}.shards/chunk-000000
-//	{bucket}/{dest}.shards/chunk-000001
+//	{bucket}/{dest}.shards/shard-000000
+//	{bucket}/{dest}.shards/shard-000001
 //	{bucket}/{dest}.shards/state.json     (during writes, deleted on completion)
 //	{bucket}/{dest}.manifest.json         (on completion)
 //
@@ -45,10 +45,10 @@
 //
 //	{
 //	  "total_size": 1073741824,
-//	  "chunk_size": 268435456,
+//	  "shard_size": 268435456,
 //	  "parts_prefix": "path/to/file.bin.shards/",
-//	  "chunks": [
-//	    {"index": 0, "object": "chunk-000000", "size": 268435456, "checksum": "..."},
+//	  "shards": [
+//	    {"object": "shard-000000", "offset": 0, "size": 268435456, "checksum": "..."},
 //	    ...
 //	  ],
 //	  "metadata": {"source_url": "...", "source_etag": "..."},

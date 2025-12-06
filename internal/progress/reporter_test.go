@@ -69,31 +69,31 @@ func TestParseBytesInvalid(t *testing.T) {
 func TestReporterChunkTracking(t *testing.T) {
 	reporter := NewReporter(Options{
 		TotalSize:      1024,
-		TotalChunks:    4,
+		TotalShards:    4,
 		Workers:        2,
 		UpdateInterval: 100 * time.Millisecond,
 	})
 
 	// Test chunk tracking without starting the reporter
-	reporter.ChunkStarted()
+	reporter.ShardStarted()
 	if reporter.inProgress.Load() != 1 {
 		t.Errorf("expected 1 in-progress, got %d", reporter.inProgress.Load())
 	}
 
 	reporter.BytesWritten(256)
-	reporter.ChunkCompleted()
+	reporter.ShardCompleted()
 	if reporter.inProgress.Load() != 0 {
 		t.Errorf("expected 0 in-progress after complete, got %d", reporter.inProgress.Load())
 	}
-	if reporter.completedChunks.Load() != 1 {
-		t.Errorf("expected 1 completed, got %d", reporter.completedChunks.Load())
+	if reporter.completedShards.Load() != 1 {
+		t.Errorf("expected 1 completed, got %d", reporter.completedShards.Load())
 	}
 	if reporter.completedBytes.Load() != 256 {
 		t.Errorf("expected 256 bytes, got %d", reporter.completedBytes.Load())
 	}
 
-	reporter.ChunkStarted()
-	reporter.ChunkFailed()
+	reporter.ShardStarted()
+	reporter.ShardFailed()
 	if reporter.inProgress.Load() != 0 {
 		t.Errorf("expected 0 in-progress after fail, got %d", reporter.inProgress.Load())
 	}
@@ -102,31 +102,31 @@ func TestReporterChunkTracking(t *testing.T) {
 func TestReporterStartStop(t *testing.T) {
 	reporter := NewReporter(Options{
 		TotalSize:      1024 * 1024,
-		TotalChunks:    4,
+		TotalShards:    4,
 		Workers:        2,
 		UpdateInterval: 10 * time.Millisecond,
 		SourceURL:      "https://example.com/file.bin",
-		ChunkSize:      256 * 1024,
+		ShardSize:      256 * 1024,
 	})
 
 	reporter.Start()
 
 	// Simulate chunk progress
-	reporter.ChunkStarted()
+	reporter.ShardStarted()
 	reporter.BytesWritten(256 * 1024)
-	reporter.ChunkCompleted()
+	reporter.ShardCompleted()
 
-	reporter.ChunkStarted()
+	reporter.ShardStarted()
 	reporter.BytesWritten(256 * 1024)
-	reporter.ChunkCompleted()
+	reporter.ShardCompleted()
 
 	time.Sleep(50 * time.Millisecond) // Let updates run
 
 	reporter.Stop()
 
 	// Verify state
-	if reporter.completedChunks.Load() != 2 {
-		t.Errorf("expected 2 completed chunks, got %d", reporter.completedChunks.Load())
+	if reporter.completedShards.Load() != 2 {
+		t.Errorf("expected 2 completed chunks, got %d", reporter.completedShards.Load())
 	}
 	if reporter.completedBytes.Load() != 512*1024 {
 		t.Errorf("expected 512KB completed, got %d", reporter.completedBytes.Load())

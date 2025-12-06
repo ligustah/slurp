@@ -15,10 +15,10 @@ import (
 	"gocloud.dev/gcerrors"
 )
 
-// ErrChunkFilled is returned by File.Next when the chunk at the current index
+// ErrShardFilled is returned by File.Next when the shard at the current index
 // has already been written in a previous session. Callers should continue to
-// the next chunk.
-var ErrChunkFilled = errors.New("chunk already filled")
+// the next shard.
+var ErrShardFilled = errors.New("shard already filled")
 
 // ErrSourceChanged is returned when metadata indicates the source has changed
 // since the last write attempt.
@@ -27,38 +27,40 @@ var ErrSourceChanged = errors.New("source changed since last attempt")
 // Manifest describes a completed sharded file.
 type Manifest struct {
 	TotalSize   int64             `json:"total_size"`
-	ChunkSize   int64             `json:"chunk_size"`
+	ShardSize   int64             `json:"shard_size"`
 	PartsPrefix string            `json:"parts_prefix"`
-	Chunks      []ChunkInfo       `json:"chunks"`
+	Shards      []ShardInfo       `json:"shards"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	CompletedAt time.Time         `json:"completed_at"`
 }
 
-// ChunkInfo describes a single chunk in the manifest.
-type ChunkInfo struct {
-	Index    int    `json:"index"`
+// ShardInfo describes a single shard in the manifest.
+// The index is implicit from the array position.
+type ShardInfo struct {
 	Object   string `json:"object"`
+	Offset   int64  `json:"offset"`
 	Size     int64  `json:"size"`
 	Checksum string `json:"checksum,omitempty"`
 }
 
-// ChunkStatus represents the state of a chunk during download.
-type ChunkStatus string
+// ShardStatus represents the state of a shard during download.
+type ShardStatus string
 
 const (
-	// ChunkPending means the chunk has not been started yet.
-	ChunkPending ChunkStatus = "pending"
-	// ChunkInProgress means the chunk is currently being downloaded.
-	ChunkInProgress ChunkStatus = "in_progress"
-	// ChunkCompleted means the chunk has been successfully written.
-	ChunkCompleted ChunkStatus = "completed"
+	// ShardPending means the shard has not been started yet.
+	ShardPending ShardStatus = "pending"
+	// ShardInProgress means the shard is currently being downloaded.
+	ShardInProgress ShardStatus = "in_progress"
+	// ShardCompleted means the shard has been successfully written.
+	ShardCompleted ShardStatus = "completed"
 )
 
-// ChunkState tracks the state of a single chunk during download.
-type ChunkState struct {
-	Index    int         `json:"index"`
-	Status   ChunkStatus `json:"status"`
+// ShardState tracks the state of a single shard during download.
+// The index is implicit from the array position.
+type ShardState struct {
+	Status   ShardStatus `json:"status"`
 	Object   string      `json:"object,omitempty"`
+	Offset   int64       `json:"offset,omitempty"`
 	Size     int64       `json:"size,omitempty"`
 	Checksum string      `json:"checksum,omitempty"`
 }
@@ -66,36 +68,36 @@ type ChunkState struct {
 // state tracks write progress for resume support.
 type state struct {
 	TotalSize   int64             `json:"total_size,omitempty"`
-	ChunkSize   int64             `json:"chunk_size"`
+	ShardSize   int64             `json:"shard_size"`
 	PartsPrefix string            `json:"parts_prefix"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
-	Chunks      []ChunkState      `json:"chunks"`
+	Shards      []ShardState      `json:"shards"`
 	StartedAt   time.Time         `json:"started_at"`
 }
 
 // Options configures sharded file operations.
 type Options struct {
-	ChunkSize       int64
+	ShardSize       int64
 	Size            int64
 	Metadata        map[string]string
 	VerifyChecksum  bool
 	ComputeChecksum bool // Compute checksums during writes (default: true)
-	StateInterval   int  // Persist state every N completed chunks
-	PrefetchCount   int  // Number of chunks to prefetch ahead (0 = disabled)
+	StateInterval   int  // Persist state every N completed shards
+	PrefetchCount   int  // Number of shards to prefetch ahead (0 = disabled)
 }
 
 // Option is a functional option for configuring sharded operations.
 type Option func(*Options)
 
-// WithChunkSize sets the size of each chunk.
-func WithChunkSize(size int64) Option {
+// WithShardSize sets the size of each shard.
+func WithShardSize(size int64) Option {
 	return func(o *Options) {
-		o.ChunkSize = size
+		o.ShardSize = size
 	}
 }
 
 // WithSize sets the total size of the file. When set, File.Next returns io.EOF
-// after all chunks have been accounted for.
+// after all shards have been accounted for.
 func WithSize(size int64) Option {
 	return func(o *Options) {
 		o.Size = size
@@ -110,7 +112,7 @@ func WithMetadata(metadata map[string]string) Option {
 }
 
 // WithVerifyChecksum enables checksum verification during reads.
-// When enabled and a chunk has no stored checksum, verification is skipped for that chunk.
+// When enabled and a shard has no stored checksum, verification is skipped for that shard.
 func WithVerifyChecksum(verify bool) Option {
 	return func(o *Options) {
 		o.VerifyChecksum = verify
@@ -118,7 +120,7 @@ func WithVerifyChecksum(verify bool) Option {
 }
 
 // WithChecksum enables or disables SHA256 checksum computation during writes.
-// When disabled, chunks are written without computing checksums, which improves
+// When disabled, shards are written without computing checksums, which improves
 // write performance but prevents later verification with WithVerifyChecksum.
 // Default is true (checksums enabled).
 //
@@ -130,14 +132,14 @@ func WithChecksum(compute bool) Option {
 	}
 }
 
-// WithStateInterval sets how often to persist state (every N completed chunks).
+// WithStateInterval sets how often to persist state (every N completed shards).
 func WithStateInterval(n int) Option {
 	return func(o *Options) {
 		o.StateInterval = n
 	}
 }
 
-// WithPrefetch sets the number of chunks to prefetch ahead during reads.
+// WithPrefetch sets the number of shards to prefetch ahead during reads.
 // This can improve read performance by overlapping I/O with processing.
 // Set to 0 to disable prefetching (default).
 func WithPrefetch(n int) Option {
@@ -157,7 +159,7 @@ type File struct {
 	state          *state
 	currentIndex   int
 	completedCount int
-	totalChunks    int
+	totalShards    int
 	closed         bool
 }
 
@@ -172,11 +174,11 @@ func Write(ctx context.Context, bucket *blob.Bucket, dest string, options ...Opt
 		opt(&opts)
 	}
 
-	if opts.ChunkSize <= 0 {
-		return nil, errors.New("sharded: chunk size must be positive")
+	if opts.ShardSize <= 0 {
+		return nil, errors.New("sharded: shard size must be positive")
 	}
 
-	// Use destination-based prefix for shards
+	// Use destination-based prefix for chunks
 	partsPrefix := dest + ".shards/"
 
 	f := &File{
@@ -189,7 +191,7 @@ func Write(ctx context.Context, bucket *blob.Bucket, dest string, options ...Opt
 
 	// Calculate total chunks if size is known
 	if opts.Size > 0 {
-		f.totalChunks = int((opts.Size + opts.ChunkSize - 1) / opts.ChunkSize)
+		f.totalShards = int((opts.Size + opts.ShardSize - 1) / opts.ShardSize)
 	}
 
 	// Try to load existing state
@@ -209,10 +211,10 @@ func (f *File) loadState(ctx context.Context) error {
 			// No existing state, start fresh
 			f.state = &state{
 				TotalSize:   f.opts.Size,
-				ChunkSize:   f.opts.ChunkSize,
+				ShardSize:   f.opts.ShardSize,
 				PartsPrefix: f.partsPrefix,
 				Metadata:    f.opts.Metadata,
-				Chunks:      []ChunkState{},
+				Shards:      []ShardState{},
 				StartedAt:   time.Now(),
 			}
 			return nil
@@ -228,22 +230,22 @@ func (f *File) loadState(ctx context.Context) error {
 	f.state = &s
 	f.partsPrefix = s.PartsPrefix
 
-	// Count completed chunks and reset in_progress chunks to pending (they were interrupted)
-	for i := range f.state.Chunks {
-		if f.state.Chunks[i].Status == ChunkCompleted {
+	// Count completed shards and reset in_progress shards to pending (they were interrupted)
+	for i := range f.state.Shards {
+		if f.state.Shards[i].Status == ShardCompleted {
 			f.completedCount++
-		} else if f.state.Chunks[i].Status == ChunkInProgress {
-			// Interrupted chunk - mark as pending for retry
-			f.state.Chunks[i].Status = ChunkPending
+		} else if f.state.Shards[i].Status == ShardInProgress {
+			// Interrupted shard - mark as pending for retry
+			f.state.Shards[i].Status = ShardPending
 		}
 	}
 
-	// Recalculate total chunks if we now have size
+	// Recalculate total shards if we now have size
 	if f.opts.Size > 0 && s.TotalSize == 0 {
 		f.state.TotalSize = f.opts.Size
-		f.totalChunks = int((f.opts.Size + f.opts.ChunkSize - 1) / f.opts.ChunkSize)
+		f.totalShards = int((f.opts.Size + f.opts.ShardSize - 1) / f.opts.ShardSize)
 	} else if s.TotalSize > 0 {
-		f.totalChunks = int((s.TotalSize + s.ChunkSize - 1) / s.ChunkSize)
+		f.totalShards = int((s.TotalSize + s.ShardSize - 1) / s.ShardSize)
 	}
 
 	return nil
@@ -280,12 +282,12 @@ func (f *File) Reset(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Delete all existing chunks
-	for _, chunk := range f.state.Chunks {
-		if chunk.Object != "" {
-			path := f.partsPrefix + chunk.Object
+	// Delete all existing shards
+	for _, shard := range f.state.Shards {
+		if shard.Object != "" {
+			path := f.partsPrefix + shard.Object
 			if err := f.bucket.Delete(ctx, path); err != nil && !isNotExist(err) {
-				return fmt.Errorf("delete chunk %s: %w", path, err)
+				return fmt.Errorf("delete shard %s: %w", path, err)
 			}
 		}
 	}
@@ -299,10 +301,10 @@ func (f *File) Reset(ctx context.Context) error {
 	// Reset to fresh state
 	f.state = &state{
 		TotalSize:   f.opts.Size,
-		ChunkSize:   f.opts.ChunkSize,
+		ShardSize:   f.opts.ShardSize,
 		PartsPrefix: f.partsPrefix,
 		Metadata:    f.opts.Metadata,
-		Chunks:      []ChunkState{},
+		Shards:      []ShardState{},
 		StartedAt:   time.Now(),
 	}
 	f.currentIndex = 0
@@ -311,12 +313,12 @@ func (f *File) Reset(ctx context.Context) error {
 	return nil
 }
 
-// Next returns the next chunk to be written.
-// Returns ErrChunkFilled if the chunk was already written (resume case).
-// Returns io.EOF when all chunks have been accounted for (requires WithSize).
+// Next returns the next shard to be written.
+// Returns ErrShardFilled if the shard was already written (resume case).
+// Returns io.EOF when all shards have been accounted for (requires WithSize).
 // Returns context error if the context is cancelled.
-func (f *File) Next(ctx context.Context) (*Chunk, error) {
-	// Check context first to avoid marking chunks as in_progress during shutdown
+func (f *File) Next(ctx context.Context) (*Shard, error) {
+	// Check context first to avoid marking shards as in_progress during shutdown
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -329,21 +331,21 @@ func (f *File) Next(ctx context.Context) (*Chunk, error) {
 	}
 
 	// Check if we've reached the end (only if size is known)
-	if f.totalChunks > 0 && f.currentIndex >= f.totalChunks {
+	if f.totalShards > 0 && f.currentIndex >= f.totalShards {
 		return nil, io.EOF
 	}
 
 	idx := f.currentIndex
 	f.currentIndex++
 
-	// Calculate chunk offset and length
-	offset := int64(idx) * f.opts.ChunkSize
-	length := f.opts.ChunkSize
+	// Calculate shard offset and length
+	offset := int64(idx) * f.opts.ShardSize
+	length := f.opts.ShardSize
 	if f.opts.Size > 0 && offset+length > f.opts.Size {
 		length = f.opts.Size - offset
 	}
 
-	chunk := &Chunk{
+	shard := &Shard{
 		file:            f,
 		index:           idx,
 		offset:          offset,
@@ -351,39 +353,37 @@ func (f *File) Next(ctx context.Context) (*Chunk, error) {
 		computeChecksum: f.opts.ComputeChecksum,
 	}
 
-	// Look up chunk state
-	chunkState := f.findChunk(idx)
-	if chunkState != nil {
-		if chunkState.Status == ChunkCompleted {
+	// Look up shard state by index
+	shardState := f.findShard(idx)
+	if shardState != nil {
+		if shardState.Status == ShardCompleted {
 			// Already completed - return info for verification if needed
-			chunk.info = &ChunkInfo{
-				Index:    chunkState.Index,
-				Object:   chunkState.Object,
-				Size:     chunkState.Size,
-				Checksum: chunkState.Checksum,
+			shard.info = &ShardInfo{
+				Object:   shardState.Object,
+				Offset:   shardState.Offset,
+				Size:     shardState.Size,
+				Checksum: shardState.Checksum,
 			}
-			return chunk, ErrChunkFilled
+			return shard, ErrShardFilled
 		}
-		// Pending chunk (from interrupted run) - mark as in_progress
-		chunkState.Status = ChunkInProgress
+		// Pending shard (from interrupted run) - mark as in_progress
+		shardState.Status = ShardInProgress
 	} else {
-		// New chunk - add to state as in_progress
-		f.state.Chunks = append(f.state.Chunks, ChunkState{
-			Index:  idx,
-			Status: ChunkInProgress,
-		})
+		// New shard - ensure array is large enough and set state
+		for len(f.state.Shards) <= idx {
+			f.state.Shards = append(f.state.Shards, ShardState{Status: ShardPending})
+		}
+		f.state.Shards[idx].Status = ShardInProgress
 	}
 
-	return chunk, nil
+	return shard, nil
 }
 
-// findChunk returns the chunk state for the given index, or nil if not found.
+// findShard returns the shard state for the given index, or nil if not found.
 // Must be called with f.mu held.
-func (f *File) findChunk(idx int) *ChunkState {
-	for i := range f.state.Chunks {
-		if f.state.Chunks[i].Index == idx {
-			return &f.state.Chunks[i]
-		}
+func (f *File) findShard(idx int) *ShardState {
+	if idx < len(f.state.Shards) {
+		return &f.state.Shards[idx]
 	}
 	return nil
 }
@@ -398,32 +398,30 @@ func (f *File) Complete(ctx context.Context) error {
 	}
 	f.closed = true
 
-	// Build manifest from completed chunks
+	// Build manifest from completed shards
 	manifest := Manifest{
 		TotalSize:   f.state.TotalSize,
-		ChunkSize:   f.state.ChunkSize,
+		ShardSize:   f.state.ShardSize,
 		PartsPrefix: f.partsPrefix,
 		Metadata:    f.state.Metadata,
 		CompletedAt: time.Now(),
 	}
 
-	// Build sorted chunks slice - only include completed chunks
-	manifest.Chunks = make([]ChunkInfo, f.completedCount)
-	for _, cs := range f.state.Chunks {
-		if cs.Status == ChunkCompleted {
-			manifest.Chunks[cs.Index] = ChunkInfo{
-				Index:    cs.Index,
-				Object:   cs.Object,
-				Size:     cs.Size,
-				Checksum: cs.Checksum,
-			}
+	// Build shards slice from state (index is implicit from array position)
+	manifest.Shards = make([]ShardInfo, len(f.state.Shards))
+	for i, ss := range f.state.Shards {
+		manifest.Shards[i] = ShardInfo{
+			Object:   ss.Object,
+			Offset:   ss.Offset,
+			Size:     ss.Size,
+			Checksum: ss.Checksum,
 		}
 	}
 
 	// Calculate total size if not set
 	if manifest.TotalSize == 0 {
-		for _, chunk := range manifest.Chunks {
-			manifest.TotalSize += chunk.Size
+		for _, shard := range manifest.Shards {
+			manifest.TotalSize += shard.Size
 		}
 	}
 
@@ -446,41 +444,41 @@ func (f *File) Complete(ctx context.Context) error {
 	return nil
 }
 
-// CompletedCount returns the number of chunks that have been written.
+// CompletedCount returns the number of shards that have been written.
 func (f *File) CompletedCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.completedCount
 }
 
-// CompletedBytes returns the total bytes of all completed chunks.
+// CompletedBytes returns the total bytes of all completed shards.
 func (f *File) CompletedBytes() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var total int64
-	for _, cs := range f.state.Chunks {
-		if cs.Status == ChunkCompleted {
-			total += cs.Size
+	for _, ss := range f.state.Shards {
+		if ss.Status == ShardCompleted {
+			total += ss.Size
 		}
 	}
 	return total
 }
 
-// TotalChunks returns the total number of chunks, or 0 if size is unknown.
-func (f *File) TotalChunks() int {
+// TotalShards returns the total number of shards, or 0 if size is unknown.
+func (f *File) TotalShards() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.totalChunks
+	return f.totalShards
 }
 
-// Chunk represents a single chunk being written.
-type Chunk struct {
+// Shard represents a single shard being written.
+type Shard struct {
 	file            *File
 	index           int
 	offset          int64
 	length          int64
 	computeChecksum bool
-	info            *ChunkInfo // Set if chunk was already filled
+	info            *ShardInfo // Set if chunk was already filled
 
 	mu           sync.Mutex
 	writer       *blob.Writer
@@ -490,144 +488,145 @@ type Chunk struct {
 	closed       bool
 }
 
-// Index returns the chunk index (0, 1, 2, ...).
-func (c *Chunk) Index() int {
-	return c.index
+// Index returns the shard index (0, 1, 2, ...).
+func (s *Shard) Index() int {
+	return s.index
 }
 
 // Offset returns the byte offset in the source data.
-func (c *Chunk) Offset() int64 {
-	return c.offset
+func (s *Shard) Offset() int64 {
+	return s.offset
 }
 
-// Length returns the expected size of this chunk.
-func (c *Chunk) Length() int64 {
-	return c.length
+// Length returns the expected size of this shard.
+func (s *Shard) Length() int64 {
+	return s.length
 }
 
-// Write writes data to the chunk.
-func (c *Chunk) Write(p []byte) (n int, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// Write writes data to the shard.
+func (s *Shard) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if c.closed {
-		return 0, errors.New("sharded: chunk is closed")
+	if s.closed {
+		return 0, errors.New("sharded: shard is closed")
 	}
 
 	// Lazy initialization
-	if c.writer == nil {
+	if s.writer == nil {
 		ctx, cancel := context.WithCancel(context.Background())
-		c.writerCancel = cancel
+		s.writerCancel = cancel
 
-		objectName := fmt.Sprintf("chunk-%06d", c.index)
-		path := c.file.partsPrefix + objectName
+		objectName := fmt.Sprintf("shard-%06d", s.index)
+		path := s.file.partsPrefix + objectName
 
-		w, err := c.file.bucket.NewWriter(ctx, path, nil)
+		w, err := s.file.bucket.NewWriter(ctx, path, nil)
 		if err != nil {
 			cancel()
-			return 0, fmt.Errorf("create chunk writer: %w", err)
+			return 0, fmt.Errorf("create shard writer: %w", err)
 		}
-		c.writer = w
-		if c.computeChecksum {
-			c.hash = &sha256Writer{hash: sha256.New()}
+		s.writer = w
+		if s.computeChecksum {
+			s.hash = &sha256Writer{hash: sha256.New()}
 		}
 	}
 
-	n, err = c.writer.Write(p)
+	n, err = s.writer.Write(p)
 	if err != nil {
 		return n, err
 	}
 
-	if c.hash != nil {
-		c.hash.Write(p[:n])
+	if s.hash != nil {
+		s.hash.Write(p[:n])
 	}
-	c.size += int64(n)
+	s.size += int64(n)
 
 	return n, nil
 }
 
-// Abort cancels the chunk write and cleans up any partial data from storage.
-// Use this when a chunk download fails or is cancelled.
-// Marks the chunk as pending so it can be retried.
+// Abort cancels the shard write and cleans up any partial data from storage.
+// Use this when a shard download fails or is cancelled.
+// Marks the shard as pending so it can be retried.
 // Safe to call multiple times or after Close.
-func (c *Chunk) Abort() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (s *Shard) Abort() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if c.closed {
+	if s.closed {
 		return
 	}
-	c.closed = true
+	s.closed = true
 
-	if c.writer != nil {
+	if s.writer != nil {
 		// Cancel the context first to abort the upload
-		if c.writerCancel != nil {
-			c.writerCancel()
+		if s.writerCancel != nil {
+			s.writerCancel()
 		}
 		// Must still close writer to release resources
-		c.writer.Close()
+		s.writer.Close()
 
 		// Delete any partial data that was uploaded before cancellation.
 		// GCS resumable uploads may have committed partial buffers.
 		ctx := context.Background()
-		objectName := fmt.Sprintf("chunk-%06d", c.index)
-		path := c.file.partsPrefix + objectName
-		c.file.bucket.Delete(ctx, path) // Best effort, ignore errors
+		objectName := fmt.Sprintf("shard-%06d", s.index)
+		path := s.file.partsPrefix + objectName
+		s.file.bucket.Delete(ctx, path) // Best effort, ignore errors
 	}
 
-	// Mark chunk as pending so it can be retried
-	c.file.mu.Lock()
-	chunkState := c.file.findChunk(c.index)
-	if chunkState != nil {
-		chunkState.Status = ChunkPending
+	// Mark shard as pending so it can be retried
+	s.file.mu.Lock()
+	shardState := s.file.findShard(s.index)
+	if shardState != nil {
+		shardState.Status = ShardPending
 	}
-	c.file.mu.Unlock()
+	s.file.mu.Unlock()
 }
 
-// Close closes the chunk, persisting it to storage and updating in-memory state.
+// Close closes the shard, persisting it to storage and updating in-memory state.
 // Does NOT persist state to storage - call File.SaveState() periodically from
 // the main goroutine for eventual consistency.
-func (c *Chunk) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (s *Shard) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if c.closed {
+	if s.closed {
 		return nil
 	}
-	c.closed = true
+	s.closed = true
 
-	// If chunk was already filled, nothing to do
-	if c.info != nil {
+	// If shard was already filled, nothing to do
+	if s.info != nil {
 		return nil
 	}
 
 	// If writer was never created (no writes), nothing to do
-	if c.writer == nil {
+	if s.writer == nil {
 		return nil
 	}
 
 	// Close the writer - this commits the blob to storage
-	if err := c.writer.Close(); err != nil {
-		return fmt.Errorf("close chunk writer: %w", err)
+	if err := s.writer.Close(); err != nil {
+		return fmt.Errorf("close shard writer: %w", err)
 	}
 
-	// Update in-memory state - mark chunk as completed
-	objectName := fmt.Sprintf("chunk-%06d", c.index)
+	// Update in-memory state - mark shard as completed
+	objectName := fmt.Sprintf("shard-%06d", s.index)
 	checksum := ""
-	if c.hash != nil {
-		checksum = c.hash.Sum()
+	if s.hash != nil {
+		checksum = s.hash.Sum()
 	}
 
-	c.file.mu.Lock()
-	chunkState := c.file.findChunk(c.index)
-	if chunkState != nil {
-		chunkState.Status = ChunkCompleted
-		chunkState.Object = objectName
-		chunkState.Size = c.size
-		chunkState.Checksum = checksum
+	s.file.mu.Lock()
+	shardState := s.file.findShard(s.index)
+	if shardState != nil {
+		shardState.Status = ShardCompleted
+		shardState.Object = objectName
+		shardState.Offset = s.offset
+		shardState.Size = s.size
+		shardState.Checksum = checksum
 	}
-	c.file.completedCount++
-	c.file.mu.Unlock()
+	s.file.completedCount++
+	s.file.mu.Unlock()
 
 	return nil
 }

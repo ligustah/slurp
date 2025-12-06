@@ -15,7 +15,7 @@ import (
 	"github.com/ligustah/slurp/pkg/sharded"
 )
 
-// runValidate checks that a sharded file is complete and all chunks exist
+// runValidate checks that a sharded file is complete and all shards exist
 // with correct sizes. Reports validation status without downloading data.
 func runValidate(args []string) int {
 	fs := flag.NewFlagSet("validate", flag.ExitOnError)
@@ -26,8 +26,8 @@ func runValidate(args []string) int {
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: slurp validate [options]
 
-Verify that a sharded file is complete and all chunks exist with correct sizes.
-Does not download actual chunk data - only checks metadata.
+Verify that a sharded file is complete and all shards exist with correct sizes.
+Does not download actual shard data - only checks metadata.
 
 Options:`)
 		fs.PrintDefaults()
@@ -74,7 +74,7 @@ Options:`)
 	// Print results
 	fmt.Printf("File: %s\n", *object)
 	fmt.Printf("Total size: %d bytes\n", result.TotalSize)
-	fmt.Printf("Chunks: %d\n", result.ChunkCount)
+	fmt.Printf("Shards: %d\n", result.ShardCount)
 
 	if result.Valid {
 		fmt.Println("Status: VALID")
@@ -82,7 +82,7 @@ Options:`)
 	}
 
 	fmt.Println("Status: INVALID")
-	fmt.Printf("Missing chunks: %d\n", result.MissingChunks)
+	fmt.Printf("Missing shards: %d\n", result.MissingShards)
 	fmt.Printf("Size mismatches: %d\n", result.SizeMismatches)
 
 	if len(result.Errors) > 0 {

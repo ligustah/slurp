@@ -24,7 +24,7 @@ func TestValidate(t *testing.T) {
 	}
 
 	f, err := Write(ctx, bucket, "test/valid.bin",
-		WithChunkSize(64*1024),
+		WithShardSize(64*1024),
 		WithSize(int64(len(data))),
 	)
 	if err != nil {
@@ -63,8 +63,8 @@ func TestValidate(t *testing.T) {
 		t.Errorf("expected total size %d, got %d", len(data), result.TotalSize)
 	}
 
-	if result.ChunkCount != 4 {
-		t.Errorf("expected 4 chunks, got %d", result.ChunkCount)
+	if result.ShardCount != 4 {
+		t.Errorf("expected 4 chunks, got %d", result.ShardCount)
 	}
 
 	if len(result.Errors) != 0 {
@@ -83,7 +83,7 @@ func TestValidateMissingChunk(t *testing.T) {
 	// Create a valid sharded file
 	data := make([]byte, 256*1024)
 	f, _ := Write(ctx, bucket, "test/missing-chunk.bin",
-		WithChunkSize(64*1024),
+		WithShardSize(64*1024),
 		WithSize(int64(len(data))),
 	)
 
@@ -109,7 +109,7 @@ func TestValidateMissingChunk(t *testing.T) {
 	reader.Close()
 
 	// Delete one chunk to simulate corruption
-	chunkPath := manifest.PartsPrefix + manifest.Chunks[1].Object
+	chunkPath := manifest.PartsPrefix + manifest.Shards[1].Object
 	bucket.Delete(ctx, chunkPath)
 
 	// Validate should fail
@@ -126,8 +126,8 @@ func TestValidateMissingChunk(t *testing.T) {
 		t.Errorf("expected 1 error, got %d: %v", len(result.Errors), result.Errors)
 	}
 
-	if result.MissingChunks != 1 {
-		t.Errorf("expected 1 missing chunk, got %d", result.MissingChunks)
+	if result.MissingShards != 1 {
+		t.Errorf("expected 1 missing chunk, got %d", result.MissingShards)
 	}
 }
 
@@ -142,7 +142,7 @@ func TestValidateSizeMismatch(t *testing.T) {
 	// Create a valid sharded file
 	data := make([]byte, 256*1024)
 	f, _ := Write(ctx, bucket, "test/size-mismatch.bin",
-		WithChunkSize(64*1024),
+		WithShardSize(64*1024),
 		WithSize(int64(len(data))),
 	)
 
@@ -168,7 +168,7 @@ func TestValidateSizeMismatch(t *testing.T) {
 	reader.Close()
 
 	// Overwrite one chunk with wrong size
-	chunkPath := manifest.PartsPrefix + manifest.Chunks[0].Object
+	chunkPath := manifest.PartsPrefix + manifest.Shards[0].Object
 	bucket.WriteAll(ctx, chunkPath, []byte("too small"), nil)
 
 	// Validate should fail

@@ -21,8 +21,8 @@ type Options struct {
 	// Workers is the number of parallel download workers.
 	Workers int
 
-	// ChunkSize is the size of each download chunk.
-	ChunkSize int64
+	// ShardSize is the size of each download shard.
+	ShardSize int64
 
 	// StateInterval is how often to persist state (every N chunks).
 	StateInterval int
@@ -36,7 +36,7 @@ type Options struct {
 	// HTTPOptions configures the HTTP client.
 	HTTPOptions slurphttp.Options
 
-	// MaxConsecutiveFailures is the number of consecutive chunk failures
+	// MaxConsecutiveFailures is the number of consecutive shard failures
 	// before the circuit breaker trips and stops the download.
 	// Set to 0 to disable (default: 10).
 	MaxConsecutiveFailures int
@@ -51,9 +51,9 @@ type Options struct {
 	StateSaveInterval time.Duration
 }
 
-// FailedChunk records information about a chunk that failed to download.
-type FailedChunk struct {
-	Index int   // Chunk index
+// FailedShard records information about a shard that failed to download.
+type FailedShard struct {
+	Index int   // Shard index
 	Error error // The error that occurred
 }
 
@@ -61,13 +61,13 @@ type FailedChunk struct {
 // It contains details about the failures that triggered the circuit breaker.
 //
 // This error is returned when:
-//   - MaxConsecutiveFailures consecutive chunk downloads fail
+//   - MaxConsecutiveFailures consecutive shard downloads fail
 //   - The circuit breaker threshold is exceeded
 //
-// Use errors.As to extract this error and inspect FailedChunks for details.
+// Use errors.As to extract this error and inspect FailedShards for details.
 type CircuitBreakerError struct {
 	ConsecutiveFailures int           // Number of consecutive failures
-	FailedChunks        []FailedChunk // Details of failed chunks
+	FailedShards        []FailedShard // Details of failed shards
 }
 
 func (e *CircuitBreakerError) Error() string {
@@ -105,8 +105,8 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	if opts.Workers <= 0 {
 		opts.Workers = 16
 	}
-	if opts.ChunkSize <= 0 {
-		opts.ChunkSize = 256 * 1024 * 1024
+	if opts.ShardSize <= 0 {
+		opts.ShardSize = 256 * 1024 * 1024
 	}
 	if opts.StateInterval <= 0 {
 		opts.StateInterval = 10
@@ -136,7 +136,7 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 
 	// Create sharded file
 	f, err := sharded.Write(ctx, bucket, dest,
-		sharded.WithChunkSize(opts.ChunkSize),
+		sharded.WithShardSize(opts.ShardSize),
 		sharded.WithSize(info.Size),
 		sharded.WithMetadata(map[string]string{
 			"source_url":  url,
@@ -176,7 +176,7 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	var (
 		cbMu                  sync.Mutex
 		consecutiveFailures   int
-		failedChunks          []FailedChunk
+		failedShards          []FailedShard
 		circuitBreakerTripped bool
 	)
 
@@ -215,11 +215,11 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	}()
 
 	// Create worker pool
-	type chunkJob struct {
-		chunk *sharded.Chunk
+	type shardJob struct {
+		shard *sharded.Shard
 	}
 
-	jobs := make(chan chunkJob, opts.Workers)
+	jobs := make(chan shardJob, opts.Workers)
 	var wg sync.WaitGroup
 
 	// Start workers
@@ -228,16 +228,16 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				err := downloadChunk(cbCtx, client, url, job.chunk, opts.Progress)
+				err := downloadShard(cbCtx, client, url, job.shard, opts.Progress)
 
 				cbMu.Lock()
 				if err != nil {
 					// Only log and track failures if not shutting down
 					if ctx.Err() == nil {
-						slog.Warn("chunk failed", "chunk", job.chunk.Index(), "error", err)
+						slog.Warn("shard failed", "shard", job.shard.Index(), "error", err)
 						consecutiveFailures++
-						failedChunks = append(failedChunks, FailedChunk{
-							Index: job.chunk.Index(),
+						failedShards = append(failedShards, FailedShard{
+							Index: job.shard.Index(),
 							Error: err,
 						})
 
@@ -264,12 +264,12 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	go func() {
 		defer close(jobs)
 		for {
-			chunk, err := f.Next(cbCtx)
+			shard, err := f.Next(cbCtx)
 			if err == io.EOF {
 				return
 			}
-			if err == sharded.ErrChunkFilled {
-				continue // Skip already-completed chunks
+			if err == sharded.ErrShardFilled {
+				continue // Skip already-completed shards
 			}
 			if err != nil {
 				// Context cancellation is expected during shutdown
@@ -281,7 +281,7 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 			}
 
 			select {
-			case jobs <- chunkJob{chunk: chunk}:
+			case jobs <- shardJob{shard: shard}:
 			case <-cbCtx.Done():
 				return
 			}
@@ -300,7 +300,7 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	if circuitBreakerTripped {
 		cbErr := &CircuitBreakerError{
 			ConsecutiveFailures: consecutiveFailures,
-			FailedChunks:        failedChunks,
+			FailedShards:        failedShards,
 		}
 		cbMu.Unlock()
 		return cbErr
@@ -325,49 +325,49 @@ func Download(ctx context.Context, url string, bucket *blob.Bucket, dest string,
 	return nil
 }
 
-// downloadChunk downloads a single chunk with resume support.
+// downloadShard downloads a single shard with resume support.
 // If the connection drops mid-download, it will retry from where it left off.
-func downloadChunk(ctx context.Context, client *slurphttp.Client, url string, chunk *sharded.Chunk, reporter *progress.Reporter) error {
+func downloadShard(ctx context.Context, client *slurphttp.Client, url string, shard *sharded.Shard, reporter *progress.Reporter) error {
 	// Early exit if context already cancelled (shutdown in progress)
 	if ctx.Err() != nil {
-		chunk.Abort()
+		shard.Abort()
 		return ctx.Err()
 	}
 
 	if reporter != nil {
-		reporter.ChunkStarted()
+		reporter.ShardStarted()
 	}
 
-	// Ensure chunk is closed/aborted on any exit path
+	// Ensure shard is closed/aborted on any exit path
 	var success bool
 	defer func() {
 		if !success {
-			chunk.Abort() // Clean up writer without updating state
+			shard.Abort() // Clean up writer without updating state
 		}
 	}()
 
-	chunkStart := chunk.Offset()
-	chunkEnd := chunkStart + chunk.Length() - 1
-	expectedSize := chunk.Length()
+	shardStart := shard.Offset()
+	shardEnd := shardStart + shard.Length() - 1
+	expectedSize := shard.Length()
 
 	downloadStart := time.Now()
-	slog.Info("chunk download started", "chunk", chunk.Index(), "offset", chunkStart, "size", expectedSize)
+	slog.Info("shard download started", "shard", shard.Index(), "offset", shardStart, "size", expectedSize)
 
 	var totalWritten int64
 
 	// Download with resume support - retry from where we left off on clean disconnects.
 	// We only retry if the server closes cleanly without error; errors (like timeouts) fail immediately.
-	const maxRetries = 10 // Safety limit for retries within a chunk
+	const maxRetries = 10 // Safety limit for retries within a shard
 	retries := 0
 
 	for totalWritten < expectedSize {
-		currentStart := chunkStart + totalWritten
-		resp, err := client.GetRange(ctx, url, currentStart, chunkEnd)
+		currentStart := shardStart + totalWritten
+		resp, err := client.GetRange(ctx, url, currentStart, shardEnd)
 		if err != nil {
 			if reporter != nil {
-				reporter.ChunkFailed()
+				reporter.ShardFailed()
 			}
-			return fmt.Errorf("download chunk %d (offset %d): %w", chunk.Index(), totalWritten, err)
+			return fmt.Errorf("download shard %d (offset %d): %w", shard.Index(), totalWritten, err)
 		}
 
 		// Verify Content-Length matches what we expect
@@ -375,16 +375,16 @@ func downloadChunk(ctx context.Context, client *slurphttp.Client, url string, ch
 		if resp.ContentLength > 0 && resp.ContentLength != expectedRemaining {
 			resp.Body.Close()
 			if reporter != nil {
-				reporter.ChunkFailed()
+				reporter.ShardFailed()
 			}
-			return fmt.Errorf("chunk %d: server returned Content-Length %d, expected %d",
-				chunk.Index(), resp.ContentLength, expectedRemaining)
+			return fmt.Errorf("shard %d: server returned Content-Length %d, expected %d",
+				shard.Index(), resp.ContentLength, expectedRemaining)
 		}
 
-		// Wrap chunk in progress writer for real-time byte tracking
-		var dst io.Writer = chunk
+		// Wrap shard in progress writer for real-time byte tracking
+		var dst io.Writer = shard
 		if reporter != nil {
-			dst = &progressWriter{w: chunk, reporter: reporter}
+			dst = &progressWriter{w: shard, reporter: reporter}
 		}
 
 		n, err := io.Copy(dst, resp.Body)
@@ -396,9 +396,9 @@ func downloadChunk(ctx context.Context, client *slurphttp.Client, url string, ch
 			// Any error during copy (timeout, network error, etc) should fail immediately
 			// We don't retry on errors - only on clean disconnects (EOF with partial data)
 			if reporter != nil {
-				reporter.ChunkFailed()
+				reporter.ShardFailed()
 			}
-			return fmt.Errorf("write chunk %d: %w", chunk.Index(), err)
+			return fmt.Errorf("write shard %d: %w", shard.Index(), err)
 		}
 
 		// If we didn't get all the data but no error, the server closed the connection cleanly
@@ -406,10 +406,10 @@ func downloadChunk(ctx context.Context, client *slurphttp.Client, url string, ch
 			retries++
 			if retries >= maxRetries {
 				if reporter != nil {
-					reporter.ChunkFailed()
+					reporter.ShardFailed()
 				}
-				return fmt.Errorf("chunk %d: too many retries (%d), only received %d of %d bytes",
-					chunk.Index(), retries, totalWritten, expectedSize)
+				return fmt.Errorf("shard %d: too many retries (%d), only received %d of %d bytes",
+					shard.Index(), retries, totalWritten, expectedSize)
 			}
 			// Continue to retry from new offset
 			continue
@@ -419,26 +419,26 @@ func downloadChunk(ctx context.Context, client *slurphttp.Client, url string, ch
 	// Verify we received all expected data
 	if totalWritten != expectedSize {
 		if reporter != nil {
-			reporter.ChunkFailed()
+			reporter.ShardFailed()
 		}
-		return fmt.Errorf("chunk %d: received %d bytes, expected %d", chunk.Index(), totalWritten, expectedSize)
+		return fmt.Errorf("shard %d: received %d bytes, expected %d", shard.Index(), totalWritten, expectedSize)
 	}
 
-	slog.Info("chunk download complete", "chunk", chunk.Index(), "size", totalWritten, "download_time", time.Since(downloadStart))
+	slog.Info("shard download complete", "shard", shard.Index(), "size", totalWritten, "download_time", time.Since(downloadStart))
 
-	// Close the chunk - this triggers the GCS upload
+	// Close the shard - this triggers the GCS upload
 	closeStart := time.Now()
-	if err := chunk.Close(); err != nil {
+	if err := shard.Close(); err != nil {
 		if reporter != nil {
-			reporter.ChunkFailed()
+			reporter.ShardFailed()
 		}
-		return fmt.Errorf("close chunk %d: %w", chunk.Index(), err)
+		return fmt.Errorf("close shard %d: %w", shard.Index(), err)
 	}
-	slog.Info("chunk uploaded", "chunk", chunk.Index(), "size", totalWritten, "upload_time", time.Since(closeStart))
+	slog.Info("shard uploaded", "shard", shard.Index(), "size", totalWritten, "upload_time", time.Since(closeStart))
 
 	success = true // Mark success so defer doesn't abort
 	if reporter != nil {
-		reporter.ChunkCompleted()
+		reporter.ShardCompleted()
 	}
 
 	return nil

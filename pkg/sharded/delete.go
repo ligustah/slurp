@@ -29,11 +29,11 @@ func Delete(ctx context.Context, bucket *blob.Bucket, dest string) error {
 		return fmt.Errorf("sharded: unmarshal manifest: %w", err)
 	}
 
-	// Delete all chunks
-	for _, chunk := range manifest.Chunks {
-		path := manifest.PartsPrefix + chunk.Object
+	// Delete all shards
+	for _, shard := range manifest.Shards {
+		path := manifest.PartsPrefix + shard.Object
 		if err := bucket.Delete(ctx, path); err != nil && !isNotExist(err) {
-			return fmt.Errorf("sharded: delete chunk %s: %w", path, err)
+			return fmt.Errorf("sharded: delete shard %s: %w", path, err)
 		}
 	}
 
@@ -51,13 +51,13 @@ func Delete(ctx context.Context, bucket *blob.Bucket, dest string) error {
 //
 // Returns an error if:
 //   - Neither state file nor manifest exists (error wraps gcerrors.NotFound)
-//   - A chunk cannot be deleted (permission denied, network error)
+//   - A shard cannot be deleted (permission denied, network error)
 //   - The context is cancelled (context.Canceled or context.DeadlineExceeded)
 func DeletePartial(ctx context.Context, bucket *blob.Bucket, dest string) error {
 	// Use destination-based prefix (same logic as Write)
 	partsPrefix := dest + ".shards/"
 
-	// Try to read state file for chunk info
+	// Try to read state file for shard info
 	statePath := partsPrefix + "state.json"
 	data, err := bucket.ReadAll(ctx, statePath)
 	if err != nil {
@@ -77,12 +77,12 @@ func DeletePartial(ctx context.Context, bucket *blob.Bucket, dest string) error 
 		return fmt.Errorf("sharded: unmarshal state: %w", err)
 	}
 
-	// Delete all chunks listed in state (any status that has an object)
-	for _, chunk := range s.Chunks {
-		if chunk.Object != "" {
-			path := partsPrefix + chunk.Object
+	// Delete all shards listed in state (any status that has an object)
+	for _, shard := range s.Shards {
+		if shard.Object != "" {
+			path := partsPrefix + shard.Object
 			if err := bucket.Delete(ctx, path); err != nil && !isNotExist(err) {
-				return fmt.Errorf("sharded: delete chunk %s: %w", path, err)
+				return fmt.Errorf("sharded: delete shard %s: %w", path, err)
 			}
 		}
 	}

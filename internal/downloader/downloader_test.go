@@ -70,7 +70,7 @@ func TestDownloadBasic(t *testing.T) {
 	// Download
 	err = Download(ctx, server.URL, bucket, "test/download.bin", Options{
 		Workers:       4,
-		ChunkSize:     256 * 1024, // 256KB chunks = 4 chunks
+		ShardSize:     256 * 1024, // 256KB chunks = 4 chunks
 		StateInterval: 1,
 	})
 	if err != nil {
@@ -141,7 +141,7 @@ func TestDownloadResume(t *testing.T) {
 	// First download - write 2 of 4 chunks manually to simulate partial download
 	chunkSize := int64(128 * 1024) // 4 chunks
 	f, err := sharded.Write(ctx, bucket, "test/resume.bin",
-		sharded.WithChunkSize(chunkSize),
+		sharded.WithShardSize(chunkSize),
 		sharded.WithSize(int64(len(data))),
 		sharded.WithMetadata(map[string]string{
 			"source_url":  server.URL,
@@ -172,7 +172,7 @@ func TestDownloadResume(t *testing.T) {
 	// Resume download - should pick up from existing state
 	err = Download(ctx, server.URL, bucket, "test/resume.bin", Options{
 		Workers:       4,
-		ChunkSize:     chunkSize,
+		ShardSize:     chunkSize,
 		StateInterval: 1,
 	})
 	if err != nil {
@@ -211,7 +211,7 @@ func TestDownloadRangeNotSupported(t *testing.T) {
 
 	err = Download(ctx, server.URL, bucket, "test/file.bin", Options{
 		Workers:   4,
-		ChunkSize: 100,
+		ShardSize: 100,
 	})
 	if err == nil {
 		t.Error("expected error for range not supported")
@@ -233,7 +233,7 @@ func TestDownloadNotFound(t *testing.T) {
 
 	err = Download(ctx, server.URL, bucket, "test/file.bin", Options{
 		Workers:   4,
-		ChunkSize: 100,
+		ShardSize: 100,
 	})
 	if err == nil {
 		t.Error("expected error for 404")
@@ -266,7 +266,7 @@ func TestDownloadContextCancellation(t *testing.T) {
 
 	err = Download(ctx, server.URL, bucket, "test/file.bin", Options{
 		Workers:   4,
-		ChunkSize: 256 * 1024,
+		ShardSize: 256 * 1024,
 	})
 	if err == nil {
 		t.Error("expected error due to context cancellation")
@@ -323,7 +323,7 @@ func TestCircuitBreaker(t *testing.T) {
 
 	err = Download(ctx, server.URL, bucket, "test/circuit-breaker.bin", Options{
 		Workers:                1, // Single worker to make failures predictable
-		ChunkSize:              256 * 1024,
+		ShardSize:              256 * 1024,
 		MaxConsecutiveFailures: 3,
 		HTTPOptions: slurphttp.Options{
 			MaxIdleConnsPerHost: 1,
@@ -347,12 +347,12 @@ func TestCircuitBreaker(t *testing.T) {
 		t.Errorf("expected 3 consecutive failures, got %d", cbErr.ConsecutiveFailures)
 	}
 
-	if len(cbErr.FailedChunks) == 0 {
+	if len(cbErr.FailedShards) == 0 {
 		t.Error("expected FailedChunks to contain failure details")
 	}
 
 	t.Logf("Circuit breaker tripped after %d failures, %d chunks failed",
-		cbErr.ConsecutiveFailures, len(cbErr.FailedChunks))
+		cbErr.ConsecutiveFailures, len(cbErr.FailedShards))
 }
 
 func TestCircuitBreakerResetsOnSuccess(t *testing.T) {
@@ -405,7 +405,7 @@ func TestCircuitBreakerResetsOnSuccess(t *testing.T) {
 	// So download should complete successfully (HTTP client has retries)
 	err = Download(ctx, server.URL, bucket, "test/intermittent.bin", Options{
 		Workers:                1,
-		ChunkSize:              256 * 1024,
+		ShardSize:              256 * 1024,
 		MaxConsecutiveFailures: 5,
 	})
 
@@ -479,7 +479,7 @@ func TestTimeoutMidDownload(t *testing.T) {
 
 	err = Download(ctx, server.URL, bucket, "test/timeout.bin", Options{
 		Workers:                1,
-		ChunkSize:              chunkSize,
+		ShardSize:              chunkSize,
 		MaxConsecutiveFailures: 2,
 		StateInterval:          1,
 		HTTPOptions: slurphttp.Options{
@@ -566,7 +566,7 @@ func TestPartialHTTPResponse(t *testing.T) {
 
 	err = Download(ctx, server.URL, bucket, "test/partial.bin", Options{
 		Workers:                1, // Single worker for predictable behavior
-		ChunkSize:              chunkSize,
+		ShardSize:              chunkSize,
 		MaxConsecutiveFailures: 2, // Trip quickly
 		StateInterval:          1,
 		HTTPOptions: slurphttp.Options{

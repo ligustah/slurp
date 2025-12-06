@@ -24,7 +24,7 @@ func TestDelete(t *testing.T) {
 	}
 
 	f, err := Write(ctx, bucket, "test/delete-me.bin",
-		WithChunkSize(64*1024), // 4 chunks
+		WithShardSize(64*1024), // 4 chunks
 		WithSize(int64(len(data))),
 	)
 	if err != nil {
@@ -74,7 +74,7 @@ func TestDelete(t *testing.T) {
 	}
 
 	// Verify chunks are gone
-	for _, chunk := range manifest.Chunks {
+	for _, chunk := range manifest.Shards {
 		path := manifest.PartsPrefix + chunk.Object
 		exists, err := bucket.Exists(ctx, path)
 		if err != nil {
@@ -120,7 +120,7 @@ func TestDeletePartialState(t *testing.T) {
 	// Create a partial sharded file (not completed)
 	data := make([]byte, 256*1024)
 	f, err := Write(ctx, bucket, "test/partial.bin",
-		WithChunkSize(64*1024),
+		WithShardSize(64*1024),
 		WithSize(int64(len(data))),
 		WithStateInterval(1),
 	)

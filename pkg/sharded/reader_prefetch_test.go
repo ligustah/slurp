@@ -30,7 +30,7 @@ func TestReaderPrefetch(t *testing.T) {
 
 	// Write sharded file
 	f, err := Write(ctx, bucket, "test/prefetch.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(totalSize),
 	)
 	if err != nil {
@@ -109,7 +109,7 @@ func TestReaderPrefetchActuallyPrefetches(t *testing.T) {
 	}
 
 	f, _ := Write(ctx, bucket, "test/prefetch-verify.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(totalSize),
 	)
 	for {
@@ -178,7 +178,7 @@ func BenchmarkReaderPrefetch(b *testing.B) {
 	data := make([]byte, totalSize)
 
 	f, _ := Write(ctx, bucket, "test/bench.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(totalSize),
 	)
 	for {

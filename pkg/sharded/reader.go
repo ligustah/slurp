@@ -12,36 +12,36 @@ import (
 	"gocloud.dev/blob"
 )
 
-// chunkResult holds the result of fetching a chunk.
-type chunkResult struct {
+// shardResult holds the result of fetching a shard.
+type shardResult struct {
 	reader io.ReadCloser
 	err    error
 }
 
-// Reader reads a sharded file, streaming all chunks in order.
+// Reader reads a sharded file, streaming all shards in order.
 type Reader struct {
 	bucket    *blob.Bucket
 	ownBucket bool // true if we opened the bucket and should close it
 	manifest  *Manifest
 	opts      Options
 
-	currentChunk   int
+	currentShard   int
 	currentReader  io.ReadCloser
 	checksumReader *checksumReader
 	closed         bool
 
-	// Prefetch support: worker pool with per-chunk result channels
+	// Prefetch support: worker pool with per-shard result channels
 	prefetchCount int
 	prefetchCtx   context.Context
 	prefetchStop  context.CancelFunc
 	prefetchOnce  sync.Once
 	prefetchWg    sync.WaitGroup
-	workCh        chan int           // chunk indices to fetch
-	results       []chan chunkResult // result channel per chunk
+	workCh        chan int           // shard indices to fetch
+	results       []chan shardResult // result channel per shard
 }
 
 // Read opens a sharded file for reading.
-// It returns an io.ReadCloser that streams all chunks in order.
+// It returns an io.ReadCloser that streams all shards in order.
 func Read(ctx context.Context, bucketURL string, dest string, options ...Option) (*Reader, error) {
 	bucket, err := blob.OpenBucket(ctx, bucketURL)
 	if err != nil {
@@ -95,10 +95,10 @@ func (r *Reader) startPrefetch() {
 	r.prefetchCtx, r.prefetchStop = context.WithCancel(context.Background())
 	r.workCh = make(chan int, r.prefetchCount)
 
-	// Create a result channel for each chunk
-	r.results = make([]chan chunkResult, len(r.manifest.Chunks))
+	// Create a result channel for each shard
+	r.results = make([]chan shardResult, len(r.manifest.Shards))
 	for i := range r.results {
-		r.results[i] = make(chan chunkResult, 1)
+		r.results[i] = make(chan shardResult, 1)
 	}
 
 	// Start worker pool
@@ -107,11 +107,11 @@ func (r *Reader) startPrefetch() {
 		go r.prefetchWorker()
 	}
 
-	// Queue all chunks for prefetching
-	go r.queueChunks()
+	// Queue all shards for prefetching
+	go r.queueShards()
 }
 
-// prefetchWorker fetches chunks from the work channel.
+// prefetchWorker fetches shards from the work channel.
 func (r *Reader) prefetchWorker() {
 	defer r.prefetchWg.Done()
 
@@ -123,9 +123,9 @@ func (r *Reader) prefetchWorker() {
 			if !ok {
 				return
 			}
-			reader, err := r.openChunkWithCtx(r.prefetchCtx, idx)
+			reader, err := r.openShardWithCtx(r.prefetchCtx, idx)
 			select {
-			case r.results[idx] <- chunkResult{reader: reader, err: err}:
+			case r.results[idx] <- shardResult{reader: reader, err: err}:
 			case <-r.prefetchCtx.Done():
 				if reader != nil {
 					reader.Close()
@@ -136,10 +136,10 @@ func (r *Reader) prefetchWorker() {
 	}
 }
 
-// queueChunks sends all chunk indices to the work channel.
-func (r *Reader) queueChunks() {
+// queueShards sends all shard indices to the work channel.
+func (r *Reader) queueShards() {
 	defer close(r.workCh)
-	for i := 0; i < len(r.manifest.Chunks); i++ {
+	for i := 0; i < len(r.manifest.Shards); i++ {
 		select {
 		case <-r.prefetchCtx.Done():
 			return
@@ -162,19 +162,19 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		if r.currentReader != nil {
 			n, err = r.currentReader.Read(p)
 			if err == io.EOF {
-				// Verify checksum if enabled and chunk has a stored checksum
+				// Verify checksum if enabled and shard has a stored checksum
 				if r.opts.VerifyChecksum && r.checksumReader != nil {
-					expected := r.manifest.Chunks[r.currentChunk-1].Checksum
-					if expected != "" { // Skip verification for chunks without checksums
+					expected := r.manifest.Shards[r.currentShard-1].Checksum
+					if expected != "" { // Skip verification for shards without checksums
 						actual := r.checksumReader.Sum()
 						if expected != actual {
-							return 0, fmt.Errorf("sharded: checksum mismatch for chunk %d: expected %s, got %s",
-								r.currentChunk-1, expected, actual)
+							return 0, fmt.Errorf("sharded: checksum mismatch for shard %d: expected %s, got %s",
+								r.currentShard-1, expected, actual)
 						}
 					}
 				}
 
-				// Close current reader and try next chunk
+				// Close current reader and try next shard
 				r.currentReader.Close()
 				r.currentReader = nil
 				r.checksumReader = nil
@@ -187,30 +187,30 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 			return n, err
 		}
 
-		// Open next chunk
-		if r.currentChunk >= len(r.manifest.Chunks) {
+		// Open next shard
+		if r.currentShard >= len(r.manifest.Shards) {
 			return 0, io.EOF
 		}
 
 		var reader io.ReadCloser
 
-		// Get chunk - either from prefetch result channel or synchronously
+		// Get shard - either from prefetch result channel or synchronously
 		if r.results != nil {
-			result := <-r.results[r.currentChunk]
+			result := <-r.results[r.currentShard]
 			if result.err != nil {
-				return 0, fmt.Errorf("sharded: open chunk %d: %w", r.currentChunk, result.err)
+				return 0, fmt.Errorf("sharded: open shard %d: %w", r.currentShard, result.err)
 			}
 			reader = result.reader
 		} else {
 			// No prefetching, open synchronously
-			reader, err = r.openChunk(r.currentChunk)
+			reader, err = r.openShard(r.currentShard)
 			if err != nil {
 				return 0, err
 			}
 		}
 
 		r.currentReader = reader
-		r.currentChunk++
+		r.currentShard++
 
 		if r.opts.VerifyChecksum {
 			r.checksumReader = &checksumReader{
@@ -222,19 +222,19 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	}
 }
 
-// openChunk opens a chunk synchronously.
-func (r *Reader) openChunk(idx int) (io.ReadCloser, error) {
-	return r.openChunkWithCtx(context.Background(), idx)
+// openShard opens a shard synchronously.
+func (r *Reader) openShard(idx int) (io.ReadCloser, error) {
+	return r.openShardWithCtx(context.Background(), idx)
 }
 
-// openChunkWithCtx opens a chunk with a context for cancellation.
-func (r *Reader) openChunkWithCtx(ctx context.Context, idx int) (io.ReadCloser, error) {
-	chunk := r.manifest.Chunks[idx]
-	path := r.manifest.PartsPrefix + chunk.Object
+// openShardWithCtx opens a shard with a context for cancellation.
+func (r *Reader) openShardWithCtx(ctx context.Context, idx int) (io.ReadCloser, error) {
+	shard := r.manifest.Shards[idx]
+	path := r.manifest.PartsPrefix + shard.Object
 
 	reader, err := r.bucket.NewReader(ctx, path, nil)
 	if err != nil {
-		return nil, fmt.Errorf("sharded: open chunk %d: %w", idx, err)
+		return nil, fmt.Errorf("sharded: open shard %d: %w", idx, err)
 	}
 	return reader, nil
 }
@@ -252,7 +252,7 @@ func (r *Reader) Close() error {
 		r.prefetchWg.Wait()
 
 		// Drain and close any prefetched readers that weren't consumed
-		for i := r.currentChunk; i < len(r.results); i++ {
+		for i := r.currentShard; i < len(r.results); i++ {
 			select {
 			case result := <-r.results[i]:
 				if result.reader != nil {

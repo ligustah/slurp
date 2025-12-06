@@ -28,7 +28,7 @@ func TestWriteAndRead(t *testing.T) {
 
 	// Write sharded file
 	f, err := Write(ctx, bucket, "test/file.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(int64(len(data))),
 		WithMetadata(map[string]string{"test": "value"}),
 	)
@@ -111,7 +111,7 @@ func TestResume(t *testing.T) {
 
 	// First write session - write only 2 chunks
 	f1, err := Write(ctx, bucket, "test/resume.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(int64(len(data))),
 		WithStateInterval(1), // Save state after every chunk
 	)
@@ -138,7 +138,7 @@ func TestResume(t *testing.T) {
 
 	// Second write session - should resume
 	f2, err := Write(ctx, bucket, "test/resume.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(int64(len(data))),
 	)
 	if err != nil {
@@ -157,7 +157,7 @@ func TestResume(t *testing.T) {
 		if err == io.EOF {
 			break
 		}
-		if err == ErrChunkFilled {
+		if err == ErrShardFilled {
 			filledCount++
 			continue
 		}
@@ -212,7 +212,7 @@ func TestReset(t *testing.T) {
 
 	// First write with metadata
 	f1, err := Write(ctx, bucket, "test/reset.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(int64(len(data))),
 		WithMetadata(map[string]string{"etag": "abc123"}),
 		WithStateInterval(1),
@@ -232,7 +232,7 @@ func TestReset(t *testing.T) {
 
 	// Second session with different metadata
 	f2, err := Write(ctx, bucket, "test/reset.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(int64(len(data))),
 		WithMetadata(map[string]string{"etag": "def456"}),
 	)
@@ -268,7 +268,7 @@ func TestChecksumVerification(t *testing.T) {
 
 	// Write
 	f, err := Write(ctx, bucket, "test/checksum.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(int64(len(data))),
 	)
 	if err != nil {
@@ -325,7 +325,7 @@ func TestWriteWithoutChecksum(t *testing.T) {
 
 	// Write with checksums disabled
 	f, err := Write(ctx, bucket, "test/no-checksum.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(int64(len(data))),
 		WithChecksum(false),
 	)
@@ -359,7 +359,7 @@ func TestWriteWithoutChecksum(t *testing.T) {
 	}
 
 	manifest := reader.Manifest()
-	for i, chunk := range manifest.Chunks {
+	for i, chunk := range manifest.Shards {
 		if chunk.Checksum != "" {
 			t.Errorf("chunk %d has checksum %q, expected empty", i, chunk.Checksum)
 		}
@@ -388,7 +388,7 @@ func TestReadWithVerificationSkipsEmptyChecksums(t *testing.T) {
 
 	// Write without checksums
 	f, err := Write(ctx, bucket, "test/verify-skip.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(int64(len(data))),
 		WithChecksum(false),
 	)
@@ -445,7 +445,7 @@ func TestCloseSuccessfullyTracksChunk(t *testing.T) {
 	data := make([]byte, chunkSize)
 
 	f, err := Write(ctx, bucket, "test/close-success.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(chunkSize),
 		WithStateInterval(1), // Save state after every chunk
 	)
@@ -467,7 +467,7 @@ func TestCloseSuccessfullyTracksChunk(t *testing.T) {
 	}
 
 	// Verify blob exists
-	objectPath := f.partsPrefix + "chunk-000000"
+	objectPath := f.partsPrefix + "shard-000000"
 	exists, err := bucket.Exists(ctx, objectPath)
 	if err != nil {
 		t.Fatalf("Exists: %v", err)
@@ -495,7 +495,7 @@ func TestAbortCleansUpPartialWrite(t *testing.T) {
 	data := make([]byte, chunkSize)
 
 	f, err := Write(ctx, bucket, "test/abort-cleanup.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(chunkSize),
 	)
 	if err != nil {
@@ -514,7 +514,7 @@ func TestAbortCleansUpPartialWrite(t *testing.T) {
 	chunk.Abort()
 
 	// Blob should NOT exist
-	objectPath := f.partsPrefix + "chunk-000000"
+	objectPath := f.partsPrefix + "shard-000000"
 	exists, err := bucket.Exists(ctx, objectPath)
 	if err != nil {
 		t.Fatalf("Exists: %v", err)
@@ -538,7 +538,7 @@ func TestChunkWriteSize(t *testing.T) {
 	totalSize := int64(3000) // Will create 3 chunks: 1024, 1024, 952
 
 	f, err := Write(ctx, bucket, "test/chunk-sizes.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		WithSize(totalSize),
 		WithStateInterval(1),
 	)
@@ -578,7 +578,7 @@ func TestChunkWriteSize(t *testing.T) {
 		}
 
 		// Verify blob size in bucket
-		objectPath := f.partsPrefix + "chunk-" + fmt.Sprintf("%06d", chunkIndex)
+		objectPath := f.partsPrefix + "shard-" + fmt.Sprintf("%06d", chunkIndex)
 		attrs, err := bucket.Attributes(ctx, objectPath)
 		if err != nil {
 			t.Fatalf("Attributes: %v", err)
@@ -607,7 +607,7 @@ func TestStreamingMode(t *testing.T) {
 
 	// Write without known size (streaming mode)
 	f, err := Write(ctx, bucket, "test/streaming.bin",
-		WithChunkSize(chunkSize),
+		WithShardSize(chunkSize),
 		// No WithSize
 	)
 	if err != nil {

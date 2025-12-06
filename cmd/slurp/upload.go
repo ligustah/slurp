@@ -27,12 +27,12 @@ func runUpload(args []string) int {
 	bucket := fs.String("bucket", "", "Destination bucket URL (required)")
 	object := fs.String("object", "", "Destination object path (required)")
 	workers := fs.Int("workers", 16, "Number of parallel workers")
-	chunkSize := fs.String("chunk-size", "256MB", "Size of each chunk")
+	shardSize := fs.String("shard-size", "256MB", "Size of each shard")
 	showProgress := fs.Bool("progress", false, "Show progress output")
-	retryAttempts := fs.Int("retry-attempts", 5, "Max retry attempts per chunk")
+	retryAttempts := fs.Int("retry-attempts", 5, "Max retry attempts per shard")
 	retryBackoff := fs.Duration("retry-backoff", 1*time.Second, "Initial retry backoff")
 	retryMaxBackoff := fs.Duration("retry-max-backoff", 30*time.Second, "Max retry backoff")
-	stateInterval := fs.Int("state-interval", 10, "Persist state every N chunks")
+	stateInterval := fs.Int("state-interval", 10, "Persist state every N shards")
 	force := fs.Bool("force", false, "Force restart, ignoring existing state")
 	noChecksum := fs.Bool("no-checksum", false, "Skip checksum computation (relies on object store integrity)")
 
@@ -56,10 +56,10 @@ Options:`)
 		return ExitInvalidArgs
 	}
 
-	// Parse chunk size
-	chunkBytes, err := progress.ParseBytes(*chunkSize)
+	// Parse shard size
+	shardBytes, err := progress.ParseBytes(*shardSize)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid chunk size: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Invalid shard size: %v\n", err)
 		return ExitInvalidArgs
 	}
 
@@ -96,18 +96,18 @@ Options:`)
 		return ExitRangeNotSupported
 	}
 
-	totalChunks := int((info.Size + chunkBytes - 1) / chunkBytes)
+	totalShards := int((info.Size + shardBytes - 1) / shardBytes)
 
 	// Setup progress reporter
 	var reporter *progress.Reporter
 	if *showProgress {
 		reporter = progress.NewReporter(progress.Options{
 			TotalSize:      info.Size,
-			TotalChunks:    totalChunks,
+			TotalShards:    totalShards,
 			Workers:        *workers,
 			UpdateInterval: 5 * time.Second,
 			SourceURL:      *url,
-			ChunkSize:      chunkBytes,
+			ShardSize:      shardBytes,
 		})
 		reporter.Start()
 		defer reporter.Stop()
@@ -116,7 +116,7 @@ Options:`)
 	// Download
 	err = downloader.Download(ctx, *url, bkt, *object, downloader.Options{
 		Workers:       *workers,
-		ChunkSize:     chunkBytes,
+		ShardSize:     shardBytes,
 		StateInterval: *stateInterval,
 		Progress:      reporter,
 		Force:         *force,

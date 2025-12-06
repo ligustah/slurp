@@ -15,8 +15,8 @@ type Options struct {
 	// TotalSize is the total size in bytes to download.
 	TotalSize int64
 
-	// TotalChunks is the total number of chunks.
-	TotalChunks int
+	// TotalShards is the total number of shards.
+	TotalShards int
 
 	// Workers is the number of parallel workers.
 	Workers int
@@ -28,8 +28,8 @@ type Options struct {
 	// SourceURL is the URL being downloaded (for display).
 	SourceURL string
 
-	// ChunkSize is the size of each chunk (for display).
-	ChunkSize int64
+	// ShardSize is the size of each shard (for display).
+	ShardSize int64
 }
 
 // Reporter outputs progress information via slog.
@@ -37,7 +37,7 @@ type Reporter struct {
 	opts Options
 
 	completedBytes  atomic.Int64
-	completedChunks atomic.Int32
+	completedShards atomic.Int32
 	inProgress      atomic.Int32
 	startTime       time.Time
 	lastBytes       int64
@@ -70,8 +70,8 @@ func (r *Reporter) Start() {
 	slog.Info("starting download",
 		"url", r.opts.SourceURL,
 		"size", humanize.IBytes(uint64(r.opts.TotalSize)),
-		"chunks", r.opts.TotalChunks,
-		"chunk_size", humanize.IBytes(uint64(r.opts.ChunkSize)),
+		"shards", r.opts.TotalShards,
+		"shard_size", humanize.IBytes(uint64(r.opts.ShardSize)),
 		"workers", r.opts.Workers,
 	)
 
@@ -92,20 +92,20 @@ func (r *Reporter) Stop() {
 	<-r.doneCh
 }
 
-// ChunkStarted marks a chunk as in progress.
-func (r *Reporter) ChunkStarted() {
+// ShardStarted marks a shard as in progress.
+func (r *Reporter) ShardStarted() {
 	r.inProgress.Add(1)
 }
 
-// ChunkCompleted marks a chunk as completed.
+// ShardCompleted marks a shard as completed.
 // Note: bytes should already have been reported via BytesWritten during streaming.
-func (r *Reporter) ChunkCompleted() {
-	r.completedChunks.Add(1)
+func (r *Reporter) ShardCompleted() {
+	r.completedShards.Add(1)
 	r.inProgress.Add(-1)
 }
 
-// ChunkFailed marks a chunk as failed (removes from in-progress).
-func (r *Reporter) ChunkFailed() {
+// ShardFailed marks a shard as failed (removes from in-progress).
+func (r *Reporter) ShardFailed() {
 	r.inProgress.Add(-1)
 }
 
@@ -117,8 +117,8 @@ func (r *Reporter) BytesWritten(n int64) {
 
 // SetResumeState sets the initial progress when resuming a download.
 // Call this before Start() to show accurate progress from the beginning.
-func (r *Reporter) SetResumeState(completedChunks int, completedBytes int64) {
-	r.completedChunks.Store(int32(completedChunks))
+func (r *Reporter) SetResumeState(completedShards int, completedBytes int64) {
+	r.completedShards.Store(int32(completedShards))
 	r.completedBytes.Store(completedBytes)
 	r.lastBytes = completedBytes
 }
@@ -144,7 +144,7 @@ func (r *Reporter) updateLoop() {
 func (r *Reporter) logProgress() {
 	now := time.Now()
 	completed := r.completedBytes.Load()
-	completedChunks := int(r.completedChunks.Load())
+	completedShards := int(r.completedShards.Load())
 	inProgress := int(r.inProgress.Load())
 
 	// Calculate speed
@@ -172,7 +172,7 @@ func (r *Reporter) logProgress() {
 		}
 	}
 
-	pending := r.opts.TotalChunks - completedChunks - inProgress
+	pending := r.opts.TotalShards - completedShards - inProgress
 	if pending < 0 {
 		pending = 0
 	}
@@ -183,16 +183,16 @@ func (r *Reporter) logProgress() {
 		"total", humanize.IBytes(uint64(r.opts.TotalSize)),
 		"speed", humanize.IBytes(uint64(speed))+"/s",
 		"eta", eta,
-		"chunks_done", completedChunks,
-		"chunks_active", inProgress,
-		"chunks_pending", pending,
+		"shards_done", completedShards,
+		"shards_active", inProgress,
+		"shards_pending", pending,
 	)
 }
 
 // logFinalStatus outputs the final status.
 func (r *Reporter) logFinalStatus() {
 	completed := r.completedBytes.Load()
-	completedChunks := int(r.completedChunks.Load())
+	completedShards := int(r.completedShards.Load())
 	duration := time.Since(r.startTime)
 	var avgSpeed float64
 	if duration.Seconds() > 0 {
@@ -202,7 +202,7 @@ func (r *Reporter) logFinalStatus() {
 	slog.Info("download complete",
 		"completed", humanize.IBytes(uint64(completed)),
 		"total", humanize.IBytes(uint64(r.opts.TotalSize)),
-		"chunks", completedChunks,
+		"shards", completedShards,
 		"duration", duration.Round(time.Second).String(),
 		"avg_speed", humanize.IBytes(uint64(avgSpeed))+"/s",
 	)

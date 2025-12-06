@@ -19,7 +19,7 @@ func Example_writeWithKnownSize() {
 
 	// Create a sharded file with known total size
 	f, _ := sharded.Write(ctx, bucket, "path/to/file.tar.gz",
-		sharded.WithChunkSize(256*1024*1024),
+		sharded.WithShardSize(256*1024*1024),
 		sharded.WithSize(1024*1024*1024), // 1GB total
 		sharded.WithMetadata(map[string]string{
 			"source_url":  "https://example.com/file.tar.gz",
@@ -30,7 +30,7 @@ func Example_writeWithKnownSize() {
 	// Write chunks - Next() returns io.EOF when all chunks accounted for
 	for {
 		chunk, err := f.Next(ctx)
-		if err == sharded.ErrChunkFilled {
+		if err == sharded.ErrShardFilled {
 			continue // Already written (resume case)
 		}
 		if err == io.EOF {
@@ -62,7 +62,7 @@ func Example_writeStreaming() {
 
 	// Create a sharded file without known size (streaming mode)
 	f, _ := sharded.Write(ctx, bucket, "path/to/file.tar.gz",
-		sharded.WithChunkSize(256*1024*1024),
+		sharded.WithShardSize(256*1024*1024),
 		// No WithSize - streaming mode
 	)
 
@@ -70,7 +70,7 @@ func Example_writeStreaming() {
 	totalChunks := 4
 	for i := 0; i < totalChunks; i++ {
 		chunk, err := f.Next(ctx)
-		if err == sharded.ErrChunkFilled {
+		if err == sharded.ErrShardFilled {
 			continue
 		}
 		if err != nil {
@@ -98,7 +98,7 @@ func Example_resume() {
 
 	// Same Write() call handles resume - checks for existing state
 	f, _ := sharded.Write(ctx, bucket, "path/to/file.tar.gz",
-		sharded.WithChunkSize(256*1024*1024),
+		sharded.WithShardSize(256*1024*1024),
 		sharded.WithSize(1024*1024*1024),
 		sharded.WithMetadata(map[string]string{
 			"source_etag": currentETag,
@@ -114,7 +114,7 @@ func Example_resume() {
 	// Same loop - ErrChunkFilled skips already-written chunks
 	for {
 		chunk, err := f.Next(ctx)
-		if err == sharded.ErrChunkFilled {
+		if err == sharded.ErrShardFilled {
 			fmt.Printf("Chunk %d already filled, skipping\n", chunk.Index())
 			continue
 		}
