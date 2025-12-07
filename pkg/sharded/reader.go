@@ -14,6 +14,7 @@ import (
 
 // shardResult holds the result of fetching a shard.
 type shardResult struct {
+	idx    int
 	reader io.ReadCloser
 	err    error
 }
@@ -30,14 +31,16 @@ type Reader struct {
 	checksumReader *checksumReader
 	closed         bool
 
-	// Prefetch support: worker pool with per-shard result channels
+	// Prefetch support: bounded worker pool
 	prefetchCount int
 	prefetchCtx   context.Context
 	prefetchStop  context.CancelFunc
 	prefetchOnce  sync.Once
 	prefetchWg    sync.WaitGroup
-	workCh        chan int           // shard indices to fetch
-	results       []chan shardResult // result channel per shard
+	resultsCh     chan shardResult    // bounded channel for prefetched results
+	nextExpected  int                 // next shard index we expect to read
+	pending       map[int]shardResult // out-of-order results waiting to be consumed
+	pendingMu     sync.Mutex
 }
 
 // Read opens a sharded file for reading.
@@ -93,57 +96,40 @@ func (r *Reader) startPrefetch() {
 	}
 
 	r.prefetchCtx, r.prefetchStop = context.WithCancel(context.Background())
-	r.workCh = make(chan int, r.prefetchCount)
+	// Bounded channel limits total prefetched shards to prefetchCount
+	r.resultsCh = make(chan shardResult, r.prefetchCount)
+	r.pending = make(map[int]shardResult)
 
-	// Create a result channel for each shard
-	r.results = make([]chan shardResult, len(r.manifest.Shards))
-	for i := range r.results {
-		r.results[i] = make(chan shardResult, 1)
-	}
-
-	// Start worker pool
-	for i := 0; i < r.prefetchCount; i++ {
-		r.prefetchWg.Add(1)
-		go r.prefetchWorker()
-	}
-
-	// Queue all shards for prefetching
-	go r.queueShards()
+	// Single worker that fetches shards sequentially
+	// The bounded resultsCh naturally limits how far ahead we can prefetch
+	r.prefetchWg.Add(1)
+	go r.prefetchWorker()
 }
 
-// prefetchWorker fetches shards from the work channel.
+// prefetchWorker fetches shards sequentially and sends to the bounded results channel.
+// The bounded channel naturally limits memory usage - if the channel is full,
+// the worker blocks until the consumer reads a result.
 func (r *Reader) prefetchWorker() {
 	defer r.prefetchWg.Done()
+	defer close(r.resultsCh)
 
-	for {
-		select {
-		case <-r.prefetchCtx.Done():
-			return
-		case idx, ok := <-r.workCh:
-			if !ok {
-				return
-			}
-			reader, err := r.openShardWithCtx(r.prefetchCtx, idx)
-			select {
-			case r.results[idx] <- shardResult{reader: reader, err: err}:
-			case <-r.prefetchCtx.Done():
-				if reader != nil {
-					reader.Close()
-				}
-				return
-			}
-		}
-	}
-}
-
-// queueShards sends all shard indices to the work channel.
-func (r *Reader) queueShards() {
-	defer close(r.workCh)
 	for i := 0; i < len(r.manifest.Shards); i++ {
 		select {
 		case <-r.prefetchCtx.Done():
 			return
-		case r.workCh <- i:
+		default:
+		}
+
+		reader, err := r.openShardWithCtx(r.prefetchCtx, i)
+		result := shardResult{idx: i, reader: reader, err: err}
+
+		select {
+		case r.resultsCh <- result:
+		case <-r.prefetchCtx.Done():
+			if reader != nil {
+				reader.Close()
+			}
+			return
 		}
 	}
 }
@@ -194,11 +180,11 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 
 		var reader io.ReadCloser
 
-		// Get shard - either from prefetch result channel or synchronously
-		if r.results != nil {
-			result := <-r.results[r.currentShard]
-			if result.err != nil {
-				return 0, fmt.Errorf("sharded: open shard %d: %w", r.currentShard, result.err)
+		// Get shard - either from prefetch channel or synchronously
+		if r.resultsCh != nil {
+			result, err := r.getNextShard()
+			if err != nil {
+				return 0, err
 			}
 			reader = result.reader
 		} else {
@@ -220,6 +206,41 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 			r.currentReader = r.checksumReader
 		}
 	}
+}
+
+// getNextShard retrieves the next shard from prefetch results.
+// It handles out-of-order results by buffering them in the pending map.
+func (r *Reader) getNextShard() (shardResult, error) {
+	wanted := r.currentShard
+
+	// Check if we already have this shard buffered
+	r.pendingMu.Lock()
+	if result, ok := r.pending[wanted]; ok {
+		delete(r.pending, wanted)
+		r.pendingMu.Unlock()
+		if result.err != nil {
+			return shardResult{}, fmt.Errorf("sharded: open shard %d: %w", wanted, result.err)
+		}
+		return result, nil
+	}
+	r.pendingMu.Unlock()
+
+	// Read from channel until we get the shard we need
+	for result := range r.resultsCh {
+		if result.idx == wanted {
+			if result.err != nil {
+				return shardResult{}, fmt.Errorf("sharded: open shard %d: %w", wanted, result.err)
+			}
+			return result, nil
+		}
+		// Buffer out-of-order results
+		r.pendingMu.Lock()
+		r.pending[result.idx] = result
+		r.pendingMu.Unlock()
+	}
+
+	// Channel closed without finding our shard
+	return shardResult{}, fmt.Errorf("sharded: shard %d not found in prefetch results", wanted)
 }
 
 // openShard opens a shard synchronously.
@@ -246,22 +267,27 @@ func (r *Reader) Close() error {
 	}
 	r.closed = true
 
-	// Stop prefetch workers
+	// Stop prefetch worker
 	if r.prefetchStop != nil {
 		r.prefetchStop()
 		r.prefetchWg.Wait()
 
-		// Drain and close any prefetched readers that weren't consumed
-		for i := r.currentShard; i < len(r.results); i++ {
-			select {
-			case result := <-r.results[i]:
-				if result.reader != nil {
-					result.reader.Close()
-				}
-			default:
-				// No result yet, worker was cancelled
+		// Drain any remaining results from the channel
+		for result := range r.resultsCh {
+			if result.reader != nil {
+				result.reader.Close()
 			}
 		}
+
+		// Close any pending out-of-order results
+		r.pendingMu.Lock()
+		for _, result := range r.pending {
+			if result.reader != nil {
+				result.reader.Close()
+			}
+		}
+		r.pending = nil
+		r.pendingMu.Unlock()
 	}
 
 	if r.currentReader != nil {
