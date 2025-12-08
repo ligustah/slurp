@@ -37,6 +37,8 @@ func run(args []string) int {
 		return runDownload(cmdArgs)
 	case "validate":
 		return runValidate(cmdArgs)
+	case "fix":
+		return runFix(cmdArgs)
 	case "delete":
 		return runDelete(cmdArgs)
 	case "help", "-h", "--help":
@@ -55,8 +57,9 @@ func printUsage() {
 Commands:
   upload    Fetch from HTTP URL and store as sharded file in object storage
   download  Read sharded file from object storage to local file or stdout
-  validate  Verify all chunks exist and sizes match manifest
-  delete    Remove sharded file and all chunks from storage
+  validate  Verify all shards exist and sizes match manifest
+  fix       Re-download missing or corrupted shards from source
+  delete    Remove sharded file and all shards from storage
 
 Run 'slurp <command> -h' for command-specific help.`)
 }
