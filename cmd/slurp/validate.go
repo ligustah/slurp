@@ -22,6 +22,7 @@ func runValidate(args []string) int {
 
 	bucket := fs.String("bucket", "", "Bucket URL (required)")
 	object := fs.String("object", "", "Object path (required)")
+	workers := fs.Int("workers", 8, "Number of parallel workers")
 
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: slurp validate [options]
@@ -64,14 +65,21 @@ Options:`)
 	}
 	defer bkt.Close()
 
-	// Validate
-	result, err := sharded.Validate(ctx, bkt, *object)
+	// Validate with progress and workers
+	result, err := sharded.Validate(ctx, bkt, *object,
+		sharded.WithValidateWorkers(*workers),
+		sharded.WithValidateProgress(func(checked, total int) {
+			fmt.Printf("\rChecking shards: %d/%d", checked, total)
+		}),
+	)
 	if err != nil {
+		fmt.Println() // Clear progress line
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return ExitStorageError
 	}
 
-	// Print results
+	// Clear progress line and print results
+	fmt.Printf("\r\033[K") // Clear line
 	fmt.Printf("File: %s\n", *object)
 	fmt.Printf("Total size: %d bytes\n", result.TotalSize)
 	fmt.Printf("Shards: %d\n", result.ShardCount)
